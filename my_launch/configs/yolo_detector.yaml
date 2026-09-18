@@ -1,0 +1,34 @@
+/yolo_detector:
+  ros__parameters:
+    # ========== 模型与输入 ==========
+    # TensorRT engine 路径。相对路径会从安装后的
+    # share/cone_detector/ 下解析，因此不依赖启动时工作目录。
+    model_path: "models/aggressive_0.engine"
+    # YOLO 置信度下限；降低可提高召回率，但会增加误检与融合候选。
+    conf_threshold: 0.1
+    # 相机输入话题；消息类型必须与 use_compressed 一致。
+    image_topic: "/zed/zed_node/rgb/color/rect/image"
+    # false 订阅 Image；true 订阅 CompressedImage 并在本节点解码。
+    # 原始图像通常延迟更低；压缩图可省带宽但增加 CPU 解码。
+    use_compressed: false
+    # 最大实际推理频率。<= 0 表示不限频；超过时跳帧，避免旧帧排队。
+    max_fps: 20.0
+    # YOLO/TensorRT 输入尺寸，必须与 engine 支持的尺寸一致。
+    # 它不是相机原始分辨率，发布检测框仍是原图像素坐标。
+    imgsz: 960 
+
+    # ========== 可视化与日志 ==========
+    # 调试图总开关。false 时不复制图像、不画框、不发布 debug 图，适合比赛模式。
+    enable_visualization: false
+    # 旧版兼容开关。必须保持 false；true 会重新启用可视化。
+    publish_debug_image: false
+    # 可视化开启时，每处理 N 帧生成一次 /yolo/debug_image。
+    # 仅有订阅者时才真正绘制和发布。
+    debug_image_every_n: 1
+    # 每检测到 N 帧目标时打印一次数量日志；0 表示关闭。
+    detect_log_interval: 0
+    # 是否输出图像转换、推理、GPU→CPU 提取、发布和总耗时。
+    # 调试延迟时开启，比赛时建议关闭。
+    enable_timing: true
+    # enable_timing=true 时，每处理 N 帧输出一次 timing 日志。
+    timing_log_interval: 30

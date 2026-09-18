@@ -1,0 +1,8 @@
+train: ['/home/juziwei/cone_ws/data/cone_detection_last.v1i.yolov8/train/images']
+
+nc: 4
+names:
+  0: BLUE
+  1: RED
+  2: YELLOW_BIG
+  3: YELLOW_SMALL

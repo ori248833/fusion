@@ -1,0 +1,88 @@
+/fusion_box_node:
+  ros__parameters:
+    # ========== 坐标系与时间配对 ==========
+    # LiDAR frame 名称，用于融合结果和可视化的坐标语义。
+    lidar_frame: "hesai_lidar"
+    # LiDAR 与 Camera 原始采集时间戳的最大差值，单位秒。
+    # 它只判断是否属于同一观测时刻，不能用来容忍 YOLO 推理延迟。
+    max_sync_diff: 0.05
+
+    # ========== 相机晚到补色与内部 Track ==========
+    # 保存历史 LiDAR 帧的时间长度，单位秒；Camera 晚到时在此缓存中找对应雷达帧。
+    lidar_history_duration: 0.60
+    # bag 回放设为 false，只按两路 header.stamp 配对；真车设为 true。
+    enable_camera_age_gate: false
+    # Camera 结果允许晚到的硬上限，单位秒；超过后不再更新颜色。
+    max_camera_result_age: 0.50
+    # 超过此年龄仍会处理，但会进入 Health 日志的高延迟统计。
+    camera_age_warn_threshold: 0.40
+    # 当前 LiDAR 锥桶与已有 Track 的最大二维关联距离。
+    # 单位必须与 lidar center.x/y 一致；当前默认按米设计。
+    track_match_distance: 1.50
+    # Track 多久没有新 LiDAR 关联后删除，单位秒。
+    track_timeout: 1.00
+    # 新颜色与已有颜色冲突时，连续多少次相同观测后才覆盖旧颜色。
+    color_conflict_confirmations: 2
+
+    # ========== 融合可视化与健康日志 ==========
+    # 2D 合成调试图总开关；false 时不构造可视化数据，不影响 Map 输出。
+    enable_visualization: false
+    # 可视化开启时，每 N 个有效 Camera 融合任务生成一次调试图。
+    visualization_every_n: 5
+    # Health 汇总日志周期，单位秒；包含帧率、超时、同步差、耗时和着色率。
+    health_log_interval: 5.0
+
+    # ========== CSV 融合调试 ==========
+    # 只保存至少成功匹配一对 LiDAR/YOLO 框的融合帧。
+    enable_visual_csv: true
+    # 每次启动会新建运行文件夹；每帧子目录含 fusion.csv 和 cones.csv。
+    visual_csv_output_directory: "/home/dian/DRd26_ws/src/my_launch/fusion_debug"
+    # 每 N 个成功融合帧保存一次；1 表示全部保存。
+    visual_csv_every_n: 1
+    # 单次运行最多保存的帧数；0 表示不限制。
+    visual_csv_max_frames: 1000
+    # true 时，每帧 cones.csv 同时保留未知颜色锥桶。
+    visual_csv_include_unknown: true
+    # 后台写盘队列满时只丢弃 CSV，不阻塞融合输出。
+    visual_csv_queue_size: 1024
+    
+    # ========== 空间匹配阈值 ==========
+    # 通过几何门控后，LiDAR 投影框与 YOLO 框的 IoU 必须大于该值才匹配。
+    overlap_threshold: 0.05
+        
+    # ==========================================
+    # 相机模型与 LiDAR→Camera 标定（基于内外参822.txt）
+    # ==========================================
+    # 图像宽高必须与 image_topic 实际图像流一致。
+    image_width: 1280
+    image_height: 720
+    
+    # K 矩阵：fx/fy 为像素焦距，cx/cy 为像素主点。
+    camera_matrix:
+      fx: 530.5870   # 原 524.5870
+      fy: 530.4340   # 原 524.2155
+      cx: 621.3621   # 原 620.3909
+      cy: 345.4201   # 原 344.0833
+    
+    # ==========================================
+    # 畸变系数，顺序 k1, k2, p1, p2, k3。
+    # 当前投影使用 rectified 图像和针孔模型；参数保留用于标定一致性。
+    # ==========================================
+    dist_coeffs: [
+      -0.0017,      # 原 -0.0074
+       0.0027,      # 原  0.0045
+       0.0000,
+       0.0000,
+       0.0000
+    ]
+    
+    # ==========================================
+    # LiDAR→Camera 的 4×4 齐次变换矩阵，行优先展开为 16 个数。
+    # 必须与上述内参、图像流和实际安装位姿属于同一套标定结果。
+    # ==========================================
+    lidar_to_camera_matrix: [
+      -0.0002, -1.0000, -0.0001,  0.0276,   # 原第一行
+      -0.0013,  0.0001, -1.0000,  0.0466,   # 原第二行
+       1.0000, -0.0002, -0.0013,  0.0235,   # 原第三行
+       0.0,     0.0,     0.0,     1.0000
+    ]

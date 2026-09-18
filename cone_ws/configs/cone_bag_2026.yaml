@@ -1,0 +1,10 @@
+path: /home/juziwei/cone_ws/data/rosbag2_2026_01_28-17_25_28
+train: images/train
+val: images/val
+
+nc: 4
+names:
+  0: BLUE
+  1: RED
+  2: YELLOW_BIG
+  3: YELLOW_SMALL

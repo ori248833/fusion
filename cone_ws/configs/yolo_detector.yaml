@@ -1,0 +1,30 @@
+/**:
+  ros__parameters:
+    # ========== 模型与基础配置 ==========
+    # 模型路径
+    # Resolved from share/cone_detector/models after colcon install.
+    model_path: "models/aggressive_0.engine"
+    ##aggressive_0.engine  best.pt
+    # 置信度阈值 (float)
+    conf_threshold: 0.25
+    # 图像订阅话题名称 (string)
+    image_topic: "/zed/zed_node/rgb/color/rect/image"
+    # 是否使用压缩图像格式 (bool)
+    use_compressed: false
+    # 最大处理帧率 (float)
+    max_fps: 20.0
+    #预处理图像的规格
+    imgsz: 960 
+
+    # ========== 调试图像与日志 ==========
+    # 是否发布调试绘制图像 (bool)
+    enable_visualization: false
+    # Legacy alias: keep false so it cannot re-enable visualization.
+    publish_debug_image: false
+    # 每 N 帧发布一次调试图像 (int)
+    debug_image_every_n: 1
+    # 检测打印日志间隔帧数 (int)
+    detect_log_interval: 0
+    # Enable briefly when measuring end-to-end latency.
+    enable_timing: true
+    timing_log_interval: 30

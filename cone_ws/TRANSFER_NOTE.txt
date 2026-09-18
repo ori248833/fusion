@@ -1,0 +1,20 @@
+This is a minimal transfer bundle for inference deployment.
+Kept:
+- src/
+- configs/
+- rviz/
+- scripts/orin_validate.sh
+- scripts/export_onnx.py
+- models/best.onnx
+- requirements.txt
+
+Not included (large/training data):
+- rosbag/
+- data/
+- runs/ (except selected model)
+- .venv/
+- .git/
+
+After extracting on target machine:
+1) adjust configs/yolo_detector.yaml model_path
+2) if deploying on Orin, build TensorRT engine from models/best.onnx

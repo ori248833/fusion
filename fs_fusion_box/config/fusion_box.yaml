@@ -1,0 +1,42 @@
+/fusion_box_node:
+  ros__parameters:
+    lidar_frame: "hesai_lidar"
+
+    max_sync_diff: 0.05
+    lidar_history_duration: 0.60
+    enable_camera_age_gate: false
+    max_camera_result_age: 0.50
+    camera_age_warn_threshold: 0.40
+    track_match_distance: 1.50
+    track_timeout: 1.00
+    color_conflict_confirmations: 2
+
+    overlap_threshold: 0.05
+
+    image_width: 1280
+    image_height: 720
+    camera_matrix:
+      fx: 530.5870
+      fy: 530.4340
+      cx: 621.3621
+      cy: 345.4201
+    dist_coeffs: [-0.0017, 0.0027, 0.0, 0.0, 0.0]
+    lidar_to_camera_matrix: [
+      -0.0002, -1.0000, -0.0001, 0.0276,
+      -0.0013,  0.0001, -1.0000, 0.0466,
+       1.0000, -0.0002, -0.0013, 0.0235,
+       0.0,     0.0,     0.0,    1.0000
+    ]
+
+    enable_visualization: false
+    visualization_every_n: 5
+    health_log_interval: 5.0
+
+    # CSV 调试：每帧创建子目录，并写入该帧的 fusion.csv 和 cones.csv。
+    # 只记录至少成功匹配一对框的融合帧。
+    enable_visual_csv: true
+    visual_csv_output_directory: "~/.ros/fusion_debug"
+    visual_csv_every_n: 1
+    visual_csv_max_frames: 1000
+    visual_csv_include_unknown: true
+    visual_csv_queue_size: 1024
