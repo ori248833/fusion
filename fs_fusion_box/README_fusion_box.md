@@ -473,7 +473,7 @@ Camera 已经使用 → 跳过
 
 ```text
 Track 已有颜色 → 下一次 LiDAR 输出继续沿用
-Track 没有颜色 → 输出 UNKNOWN
+Track 没有颜色 → 按 LiDAR 标签输出 UNKNOWN_SMALL（label=1）或 UNKNOWN_BIG（label=2）
 ```
 
 LiDAR 锥桶本身永远保留。
@@ -864,4 +864,3 @@ label 2 = big
 12. `track_match_distance` 与 LiDAR 坐标单位和车辆速度匹配。
 13. 比赛模式关闭 `enable_visualization`。
 14. Ctrl+C 后两个工作线程能退出并打印最终摘要。
-

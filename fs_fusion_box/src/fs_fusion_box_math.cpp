@@ -40,6 +40,29 @@ bool is_supported_map_color(int color) {
            color == drd25_msgs::msg::Cone::YELLOW_SMALL;
 }
 
+bool is_confirmed_map_color(uint8_t color) {
+    return color == drd25_msgs::msg::Cone::BLUE ||
+           color == drd25_msgs::msg::Cone::RED ||
+           color == drd25_msgs::msg::Cone::YELLOW_BIG ||
+           color == drd25_msgs::msg::Cone::YELLOW_SMALL;
+}
+
+uint8_t unknown_color_from_lidar_detection(
+    const vision_msgs::msg::Detection3D& lidar_detection) {
+    int lidar_label = -1;
+    if (!lidar_detection.results.empty()) {
+        lidar_label = parse_class_id(lidar_detection.results.front());
+    }
+
+    if (lidar_label == 1) {
+        return drd25_msgs::msg::Cone::UNKNOWN_SMALL;
+    }
+    if (lidar_label == 2) {
+        return drd25_msgs::msg::Cone::UNKNOWN_BIG;
+    }
+    return drd25_msgs::msg::Cone::UNKNOWN;
+}
+
 uint8_t resolve_color(
     int mapped_camera_color,
     const vision_msgs::msg::Detection3D& lidar_detection) {
@@ -194,7 +217,7 @@ FusionResult fuse_measurements(
         drd25_msgs::msg::Cone cone;
         cone.x = lidar_detection.bbox.center.position.x;
         cone.y = lidar_detection.bbox.center.position.y;
-        cone.color = drd25_msgs::msg::Cone::UNKNOWN;
+        cone.color = unknown_color_from_lidar_detection(lidar_detection);
         result.fused_cones.push_back(cone);
     }
 
@@ -287,7 +310,7 @@ FusionResult fuse_measurements(
         const uint8_t final_color = resolve_color(
             mapped_camera_color,
             lidar_msg->detections[candidate.lidar_index]);
-        if (final_color == drd25_msgs::msg::Cone::UNKNOWN) {
+        if (!is_confirmed_map_color(final_color)) {
             continue;
         }
 

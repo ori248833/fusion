@@ -33,6 +33,7 @@
 
 #include "cone_interfaces/msg/cone.hpp"
 #include "cone_interfaces/msg/cone_array.hpp"
+#include "drd25_msgs/msg/cone.hpp"
 #include "drd25_msgs/msg/map.hpp"
 #include "fs_fusion_box/fs_fusion_box_math.hpp"
 #include "fs_fusion_box/visualizer.hpp"
@@ -67,6 +68,29 @@ double percentile(std::vector<double> values, double fraction) {
     const double raw_index = fraction * static_cast<double>(values.size() - 1);
     const size_t index = static_cast<size_t>(std::ceil(raw_index));
     return values[std::min(index, values.size() - 1)];
+}
+
+bool is_unknown_map_color(uint8_t color) {
+    return color == drd25_msgs::msg::Cone::UNKNOWN ||
+           color == drd25_msgs::msg::Cone::UNKNOWN_BIG ||
+           color == drd25_msgs::msg::Cone::UNKNOWN_SMALL;
+}
+
+bool is_confirmed_map_color(uint8_t color) {
+    return color == drd25_msgs::msg::Cone::BLUE ||
+           color == drd25_msgs::msg::Cone::RED ||
+           color == drd25_msgs::msg::Cone::YELLOW_BIG ||
+           color == drd25_msgs::msg::Cone::YELLOW_SMALL;
+}
+
+uint8_t unknown_color_from_lidar_label(int32_t label) {
+    if (label == 1) {
+        return drd25_msgs::msg::Cone::UNKNOWN_SMALL;
+    }
+    if (label == 2) {
+        return drd25_msgs::msg::Cone::UNKNOWN_BIG;
+    }
+    return drd25_msgs::msg::Cone::UNKNOWN;
 }
 
 }  // namespace
@@ -342,10 +366,13 @@ private:
                 output.y = lidar_cone.center.y;
 
                 const auto track_it = tracks_.find(track_ids[i]);
-                output.color = track_it == tracks_.end()
-                    ? drd25_msgs::msg::Cone::UNKNOWN
-                    : track_it->second.color;
-                if (output.color != drd25_msgs::msg::Cone::UNKNOWN) {
+                const uint8_t lidar_unknown_color =
+                    unknown_color_from_lidar_label(lidar_cone.label);
+                output.color = track_it != tracks_.end() &&
+                        is_confirmed_map_color(track_it->second.color)
+                    ? track_it->second.color
+                    : lidar_unknown_color;
+                if (is_confirmed_map_color(output.color)) {
                     ++colored_count;
                 }
                 output_cones.push_back(output);
@@ -575,8 +602,8 @@ private:
         for (size_t i = 0; i < fused_cones.size(); ++i) {
             const uint8_t new_color = fused_cones[i].color;
             if (i >= count) {
-                if (new_color != drd25_msgs::msg::Cone::UNKNOWN) {
-                    snapshot.colors[i] = new_color;
+                snapshot.colors[i] = new_color;
+                if (is_confirmed_map_color(new_color)) {
                     snapshot.decisions[i] = "匹配成功，跟踪信息缺失";
                 }
                 continue;
@@ -584,23 +611,28 @@ private:
 
             auto track_it = tracks_.find(frame.track_ids[i]);
             if (track_it == tracks_.end()) {
-                if (new_color != drd25_msgs::msg::Cone::UNKNOWN) {
-                    snapshot.colors[i] = new_color;
+                snapshot.colors[i] = new_color;
+                if (is_confirmed_map_color(new_color)) {
                     snapshot.decisions[i] = "匹配成功，跟踪已失效";
                 }
                 continue;
             }
             Track& track = track_it->second;
 
-            if (new_color == drd25_msgs::msg::Cone::UNKNOWN) {
-                snapshot.colors[i] = track.color;
-                if (track.color != drd25_msgs::msg::Cone::UNKNOWN) {
+            // UNKNOWN_SMALL and UNKNOWN_BIG carry LiDAR size only.  They must
+            // not overwrite the color memory, but should be emitted when no
+            // camera-confirmed track color is available.
+            if (!is_confirmed_map_color(new_color)) {
+                snapshot.colors[i] = is_confirmed_map_color(track.color)
+                    ? track.color
+                    : new_color;
+                if (is_confirmed_map_color(track.color)) {
                     snapshot.decisions[i] = "沿用历史颜色";
                 }
                 continue;
             }
 
-            if (track.color == drd25_msgs::msg::Cone::UNKNOWN) {
+            if (!is_confirmed_map_color(track.color)) {
                 track.color = new_color;
                 track.pending_color = drd25_msgs::msg::Cone::UNKNOWN;
                 track.pending_color_count = 0;
@@ -654,8 +686,14 @@ private:
                 return "大黄锥";
             case drd25_msgs::msg::Cone::YELLOW_SMALL:
                 return "小黄锥";
-            default:
+            case drd25_msgs::msg::Cone::UNKNOWN_BIG:
+                return "未知颜色-大锥";
+            case drd25_msgs::msg::Cone::UNKNOWN_SMALL:
+                return "未知颜色-小锥";
+            case drd25_msgs::msg::Cone::UNKNOWN:
                 return "未知";
+            default:
+                return "无效颜色值";
         }
     }
 
@@ -888,7 +926,7 @@ private:
         cones_csv << std::fixed << std::setprecision(3);
         for (const auto& cone : frame.cones) {
             if (!visual_csv_include_unknown_ &&
-                cone.color == drd25_msgs::msg::Cone::UNKNOWN) {
+                is_unknown_map_color(cone.color)) {
                 continue;
             }
             cones_csv << frame.frame_index << ',' << cone.cone_index + 1
