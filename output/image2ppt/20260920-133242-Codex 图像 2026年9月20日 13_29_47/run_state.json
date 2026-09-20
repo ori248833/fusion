@@ -1,0 +1,24 @@
+{
+  "status": "pages_recorded",
+  "history": [
+    {
+      "from": "created",
+      "to": "inputs_prepared",
+      "at": "2026-09-20T05:32:42Z",
+      "note": "prepared inputs and page jobs"
+    },
+    {
+      "from": "inputs_prepared",
+      "to": "pages_dispatched",
+      "at": "2026-09-20T05:34:27Z",
+      "note": "all pages dispatched"
+    },
+    {
+      "from": "pages_dispatched",
+      "to": "pages_recorded",
+      "at": "2026-09-20T05:50:13Z",
+      "note": "all pages recorded"
+    }
+  ],
+  "updated_at": "2026-09-20T05:50:13Z"
+}

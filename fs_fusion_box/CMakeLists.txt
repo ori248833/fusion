@@ -46,6 +46,7 @@ include_directories(
 # ==========================================
 add_library(fs_fusion_box_lib 
   src/fs_fusion_box_math.cpp
+  src/showcase_renderer.cpp
   src/visualizer.cpp
 )
 

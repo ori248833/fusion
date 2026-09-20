@@ -1,0 +1,20 @@
+{
+  "schema_version": "image2ppt-visual-review-evidence-v1",
+  "pages": [
+    {
+      "page_id": "page_001",
+      "source": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\source.png",
+      "rendered": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\render\\rendered.png",
+      "source_sha256": "8ed4dd7cad875953f496f2dca09e2a4a3fbdf709571945ba0ddf569a177347c0",
+      "rendered_sha256": "be99983c7d3d5bdfe6e92422fd0fb4ad0980db5e71173f5b6156b1f6fff0f406",
+      "reviewed": false,
+      "checks": {
+        "composition_layout": "",
+        "text_content": "",
+        "object_completeness": "",
+        "render_integrity": "",
+        "compound_diagram": ""
+      }
+    }
+  ]
+}

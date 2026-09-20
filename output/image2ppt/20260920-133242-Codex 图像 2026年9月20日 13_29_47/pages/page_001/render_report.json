@@ -1,0 +1,45 @@
+{
+  "schema_version": "image2ppt-render-qa-v1",
+  "status": "rendered",
+  "renderer": "powerpoint-com",
+  "pptx": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\page.pptx",
+  "out_dir": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\render",
+  "rendered_png": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\render\\rendered.png",
+  "rendered_slides": [
+    "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\render\\rendered.png"
+  ],
+  "source_image": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\source.png",
+  "raw": {
+    "status": "rendered",
+    "renderer": "powerpoint-com",
+    "backend": "powerpoint-export-png",
+    "returncode": 0,
+    "stdout": "",
+    "stderr": "",
+    "command": [
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$ErrorActionPreference='Stop';$app=$null;$deck=$null;try{$app=New-Object -ComObject PowerPoint.Application;$deck=$app.Presentations.Open('D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\page.pptx',$true,$true,$false);$deck.Export('D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\render','PNG')}finally{if($null -ne $deck){try{$deck.Close()}catch{};try{[System.Runtime.InteropServices.Marshal]::ReleaseComObject($deck)|Out-Null}catch{};$deck=$null};if($null -ne $app){try{$app.Quit()}catch{};try{[System.Runtime.InteropServices.Marshal]::ReleaseComObject($app)|Out-Null}catch{};$app=$null}}"
+    ],
+    "slides": [
+      "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\render\\rendered.png"
+    ]
+  },
+  "diff_metrics": {
+    "source_png": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\source.png",
+    "rendered_png": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\render\\rendered.png",
+    "source_size": [
+      1619,
+      971
+    ],
+    "rendered_original_size": [
+      1619,
+      971
+    ],
+    "mean_abs_rgb_diff_0_255": 2.16,
+    "max_abs_rgb_diff_0_255": 255,
+    "note": "Indicative only; the page still requires visual review."
+  }
+}

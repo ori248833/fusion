@@ -28,6 +28,7 @@
 
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <vision_msgs/msg/detection2_d_array.hpp>
 #include <vision_msgs/msg/detection3_d_array.hpp>
 
@@ -36,6 +37,7 @@
 #include "drd25_msgs/msg/cone.hpp"
 #include "drd25_msgs/msg/map.hpp"
 #include "fs_fusion_box/fs_fusion_box_math.hpp"
+#include "fs_fusion_box/showcase_renderer.hpp"
 #include "fs_fusion_box/visualizer.hpp"
 #include "lidar_cone_detector/msg/three_d_cone.hpp"
 #include "lidar_cone_detector/msg/three_d_cone_array.hpp"
@@ -99,6 +101,7 @@ class FusionNode : public rclcpp::Node {
 public:
     using LidarMsg = lidar_cone_detector::msg::ThreeDConeArray;
     using CameraMsg = cone_interfaces::msg::ConeArray;
+    using CloudMsg = sensor_msgs::msg::PointCloud2;
 
     FusionNode()
         : Node("fusion_box_node"),
@@ -134,6 +137,7 @@ public:
                 this,
                 std::placeholders::_1));
 
+        initialize_showcase_capture();
         initialize_csv_logging();
         fusion_thread_ = std::thread(&FusionNode::fusion_loop, this);
         visualization_thread_ = std::thread(&FusionNode::visualization_loop, this);
@@ -188,6 +192,13 @@ private:
         std::vector<uint64_t> track_ids;
         std::vector<uint8_t> final_colors;
         std::vector<std::string> decisions;
+    };
+
+    struct ShowcaseCaptureTask {
+        CloudMsg::ConstSharedPtr cloud;
+        LidarMsg::ConstSharedPtr lidar_msg;
+        std::vector<uint8_t> final_colors;
+        std::filesystem::path output_path;
     };
 
     struct TrackCandidate {
@@ -256,6 +267,25 @@ private:
         declare_parameter("visualization_every_n", 1);
         declare_parameter("health_log_interval", 5.0);
 
+        // One-shot presentation image. When disabled, no raw point cloud
+        // subscription or rendering thread is created.
+        declare_parameter("enable_showcase_capture", false);
+        declare_parameter("showcase_pointcloud_topic", "/lidar_points");
+        declare_parameter(
+            "showcase_output_directory", "~/.ros/fusion_showcase");
+        declare_parameter("showcase_image_width", 1920);
+        declare_parameter("showcase_image_height", 1080);
+        declare_parameter("showcase_min_fused_cones", 3);
+        declare_parameter("showcase_capture_timeout", 15.0);
+        declare_parameter("showcase_max_sync_diff", 0.03);
+        declare_parameter("showcase_cloud_history_duration", 0.80);
+        declare_parameter("showcase_point_stride", 2);
+        declare_parameter("showcase_forward_min", -5.0);
+        declare_parameter("showcase_forward_max", 35.0);
+        declare_parameter("showcase_lateral_limit", 15.0);
+        declare_parameter("showcase_height_min", -3.0);
+        declare_parameter("showcase_height_max", 5.0);
+
         // CSV debug output is disabled by default and written asynchronously.
         declare_parameter("enable_visual_csv", false);
         declare_parameter(
@@ -287,6 +317,42 @@ private:
             get_parameter("enable_visualization").as_bool());
         visualization_every_n_.store(static_cast<size_t>(
             std::max<int64_t>(1, get_parameter("visualization_every_n").as_int())));
+
+        enable_showcase_capture_ =
+            get_parameter("enable_showcase_capture").as_bool();
+        showcase_pointcloud_topic_ =
+            get_parameter("showcase_pointcloud_topic").as_string();
+        showcase_output_directory_ =
+            get_parameter("showcase_output_directory").as_string();
+        showcase_render_options_.image_width = static_cast<int>(
+            std::max<int64_t>(
+                320, get_parameter("showcase_image_width").as_int()));
+        showcase_render_options_.image_height = static_cast<int>(
+            std::max<int64_t>(
+                240, get_parameter("showcase_image_height").as_int()));
+        showcase_min_fused_cones_ = static_cast<size_t>(
+            std::max<int64_t>(
+                1, get_parameter("showcase_min_fused_cones").as_int()));
+        showcase_capture_timeout_ = std::max(
+            1.0, get_parameter("showcase_capture_timeout").as_double());
+        showcase_max_sync_diff_ = std::max(
+            0.0, get_parameter("showcase_max_sync_diff").as_double());
+        showcase_cloud_history_duration_ = std::max(
+            showcase_max_sync_diff_,
+            get_parameter("showcase_cloud_history_duration").as_double());
+        showcase_render_options_.point_stride = static_cast<size_t>(
+            std::max<int64_t>(
+                1, get_parameter("showcase_point_stride").as_int()));
+        showcase_render_options_.forward_min =
+            get_parameter("showcase_forward_min").as_double();
+        showcase_render_options_.forward_max =
+            get_parameter("showcase_forward_max").as_double();
+        showcase_render_options_.lateral_limit = std::max(
+            0.1, get_parameter("showcase_lateral_limit").as_double());
+        showcase_render_options_.height_min =
+            get_parameter("showcase_height_min").as_double();
+        showcase_render_options_.height_max =
+            get_parameter("showcase_height_max").as_double();
 
         enable_visual_csv_ = get_parameter("enable_visual_csv").as_bool();
         visual_csv_output_directory_ =
@@ -335,12 +401,16 @@ private:
 
         fusion_cv_.notify_all();
         visualization_cv_.notify_all();
+        showcase_cv_.notify_all();
 
         if (fusion_thread_.joinable()) {
             fusion_thread_.join();
         }
         if (visualization_thread_.joinable()) {
             visualization_thread_.join();
+        }
+        if (showcase_thread_.joinable()) {
+            showcase_thread_.join();
         }
 
         csv_running_.store(false, std::memory_order_relaxed);
@@ -457,6 +527,186 @@ private:
         }
         camera_accepted_.fetch_add(1, std::memory_order_relaxed);
         fusion_cv_.notify_one();
+    }
+
+    void initialize_showcase_capture() {
+        if (!enable_showcase_capture_) {
+            return;
+        }
+        if (showcase_pointcloud_topic_.empty()) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "Showcase capture disabled: showcase_pointcloud_topic is empty");
+            enable_showcase_capture_ = false;
+            return;
+        }
+        if (showcase_render_options_.forward_min >=
+                showcase_render_options_.forward_max ||
+            showcase_render_options_.height_min >=
+                showcase_render_options_.height_max) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "Showcase capture disabled: invalid point-cloud view range");
+            enable_showcase_capture_ = false;
+            return;
+        }
+
+        try {
+            showcase_output_path_ =
+                expand_user_path(showcase_output_directory_);
+            std::filesystem::create_directories(showcase_output_path_);
+        } catch (const std::exception& error) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "Showcase capture disabled: cannot create output directory: %s",
+                error.what());
+            enable_showcase_capture_ = false;
+            return;
+        }
+
+        showcase_cloud_sub_ = create_subscription<CloudMsg>(
+            showcase_pointcloud_topic_,
+            rclcpp::SensorDataQoS().keep_last(10),
+            std::bind(
+                &FusionNode::showcase_cloud_callback,
+                this,
+                std::placeholders::_1));
+        showcase_timeout_timer_ = create_wall_timer(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::duration<double>(showcase_capture_timeout_)),
+            std::bind(&FusionNode::handle_showcase_timeout, this));
+        showcase_thread_ = std::thread(
+            &FusionNode::showcase_writer_loop, this);
+
+        RCLCPP_INFO(
+            get_logger(),
+            "One-shot showcase capture enabled: topic=%s output=%s "
+            "minimum_colored_cones=%zu timeout=%.1fs",
+            showcase_pointcloud_topic_.c_str(),
+            showcase_output_path_.string().c_str(),
+            showcase_min_fused_cones_,
+            showcase_capture_timeout_);
+    }
+
+    void showcase_cloud_callback(const CloudMsg::ConstSharedPtr& msg) {
+        if (!enable_showcase_capture_ ||
+            showcase_capture_completed_.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        const double current_stamp = stamp_to_sec(msg->header.stamp);
+        std::lock_guard<std::mutex> lock(showcase_mutex_);
+        if (showcase_capture_queued_) {
+            return;
+        }
+        showcase_cloud_history_.push_back(msg);
+        while (!showcase_cloud_history_.empty()) {
+            const double oldest_stamp = stamp_to_sec(
+                showcase_cloud_history_.front()->header.stamp);
+            if (current_stamp - oldest_stamp <=
+                    showcase_cloud_history_duration_ &&
+                showcase_cloud_history_.size() <= 64) {
+                break;
+            }
+            showcase_cloud_history_.pop_front();
+        }
+    }
+
+    std::filesystem::path make_showcase_output_path(
+        const builtin_interfaces::msg::Time& stamp) const {
+        std::ostringstream name;
+        name << "fusion_effect_" << stamp.sec << '_'
+             << std::setfill('0') << std::setw(9) << stamp.nanosec
+             << ".png";
+        return showcase_output_path_ / name.str();
+    }
+
+    void handle_showcase_timeout() {
+        if (!enable_showcase_capture_ ||
+            showcase_capture_completed_.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(showcase_mutex_);
+            if (showcase_capture_queued_) {
+                return;
+            }
+            showcase_cloud_history_.clear();
+            showcase_capture_completed_.store(
+                true, std::memory_order_relaxed);
+        }
+        showcase_cloud_sub_.reset();
+        if (showcase_timeout_timer_) {
+            showcase_timeout_timer_->cancel();
+        }
+        RCLCPP_WARN(
+            get_logger(),
+            "Showcase capture timed out after %.1f s without a frame that "
+            "met the synchronization and colored-cone requirements",
+            showcase_capture_timeout_);
+    }
+
+    void showcase_writer_loop() {
+        while (running_.load(std::memory_order_relaxed)) {
+            std::optional<ShowcaseCaptureTask> task;
+            {
+                std::unique_lock<std::mutex> lock(showcase_mutex_);
+                showcase_cv_.wait(lock, [&] {
+                    return showcase_task_.has_value() ||
+                           !running_.load(std::memory_order_relaxed);
+                });
+                if (!running_.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                task = std::move(showcase_task_);
+                showcase_task_.reset();
+            }
+
+            ShowcaseRenderStats stats;
+            std::string error;
+            const bool success = render_showcase_image(
+                *task->cloud,
+                *task->lidar_msg,
+                task->final_colors,
+                showcase_render_options_,
+                task->output_path,
+                stats,
+                error);
+
+            if (success) {
+                {
+                    std::lock_guard<std::mutex> lock(showcase_mutex_);
+                    showcase_cloud_history_.clear();
+                    showcase_capture_queued_ = false;
+                    showcase_capture_completed_.store(
+                        true, std::memory_order_relaxed);
+                }
+                showcase_cloud_sub_.reset();
+                if (showcase_timeout_timer_) {
+                    showcase_timeout_timer_->cancel();
+                }
+                RCLCPP_INFO(
+                    get_logger(),
+                    "Showcase image saved: %s | input=%zu rendered=%zu "
+                    "colored=%zu cones=%zu",
+                    task->output_path.string().c_str(),
+                    stats.input_points,
+                    stats.rendered_points,
+                    stats.colored_points,
+                    stats.rendered_cones);
+                break;
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(showcase_mutex_);
+                    showcase_capture_queued_ = false;
+                }
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Showcase render failed; waiting for another valid frame: %s",
+                    error.c_str());
+            }
+        }
     }
 
     std::vector<uint64_t> associate_tracks_locked(
@@ -589,6 +839,8 @@ private:
 
             maybe_queue_csv_frame(
                 task, fusion_result, color_snapshot);
+            maybe_queue_showcase_capture(
+                task.lidar_frame, color_snapshot.colors);
             maybe_queue_visualization(
                 task,
                 std::move(projected_boxes),
@@ -1010,6 +1262,76 @@ private:
         }
     }
 
+    void maybe_queue_showcase_capture(
+        const LidarHistoryFrame& lidar_frame,
+        const std::vector<uint8_t>& final_colors) {
+        if (!enable_showcase_capture_ ||
+            showcase_capture_completed_.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        const size_t colored_cones = static_cast<size_t>(std::count_if(
+            final_colors.begin(),
+            final_colors.end(),
+            [](uint8_t color) {
+                return is_confirmed_map_color(color);
+            }));
+        if (colored_cones < showcase_min_fused_cones_) {
+            return;
+        }
+
+        CloudMsg::ConstSharedPtr best_cloud;
+        double best_difference = std::numeric_limits<double>::max();
+        {
+            std::lock_guard<std::mutex> lock(showcase_mutex_);
+            if (showcase_capture_queued_ ||
+                showcase_capture_completed_.load(std::memory_order_relaxed)) {
+                return;
+            }
+            for (const auto& cloud : showcase_cloud_history_) {
+                const double difference = std::abs(
+                    stamp_to_sec(cloud->header.stamp) - lidar_frame.stamp);
+                if (difference < best_difference) {
+                    best_difference = difference;
+                    best_cloud = cloud;
+                }
+            }
+            if (!best_cloud || best_difference > showcase_max_sync_diff_) {
+                return;
+            }
+            if (!best_cloud->header.frame_id.empty() &&
+                !lidar_frame.msg->header.frame_id.empty() &&
+                best_cloud->header.frame_id !=
+                    lidar_frame.msg->header.frame_id) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(),
+                    *get_clock(),
+                    2000,
+                    "Showcase capture skipped: point cloud frame '%s' does "
+                    "not match detection frame '%s'",
+                    best_cloud->header.frame_id.c_str(),
+                    lidar_frame.msg->header.frame_id.c_str());
+                return;
+            }
+
+            showcase_capture_queued_ = true;
+            showcase_task_ = ShowcaseCaptureTask{
+                best_cloud,
+                lidar_frame.msg,
+                final_colors,
+                make_showcase_output_path(lidar_frame.msg->header.stamp)};
+            showcase_cloud_history_.clear();
+        }
+        showcase_cv_.notify_one();
+        RCLCPP_INFO(
+            get_logger(),
+            "Showcase frame selected: stamp=%.9f colored_cones=%zu "
+            "cloud_sync=%.3fms",
+            lidar_frame.stamp,
+            colored_cones,
+            best_difference * 1000.0);
+    }
+
     void maybe_queue_visualization(
         const FusionTask& task,
         std::vector<ProjectedBox> projected_boxes,
@@ -1352,7 +1674,9 @@ private:
     rclcpp::Publisher<drd25_msgs::msg::Map>::SharedPtr map_pub_;
     rclcpp::Subscription<LidarMsg>::SharedPtr lidar_sub_;
     rclcpp::Subscription<CameraMsg>::SharedPtr camera_sub_;
+    rclcpp::Subscription<CloudMsg>::SharedPtr showcase_cloud_sub_;
     rclcpp::TimerBase::SharedPtr health_timer_;
+    rclcpp::TimerBase::SharedPtr showcase_timeout_timer_;
     OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
     std::shared_ptr<Visualizer> visualizer_;
 
@@ -1374,6 +1698,23 @@ private:
     std::atomic<bool> enable_visualization_{false};
     std::atomic<size_t> visualization_every_n_{1};
     std::atomic<size_t> visualization_candidate_count_{0};
+
+    bool enable_showcase_capture_{false};
+    std::string showcase_pointcloud_topic_{"/lidar_points"};
+    std::string showcase_output_directory_{"~/.ros/fusion_showcase"};
+    std::filesystem::path showcase_output_path_;
+    size_t showcase_min_fused_cones_{3};
+    double showcase_capture_timeout_{15.0};
+    double showcase_max_sync_diff_{0.03};
+    double showcase_cloud_history_duration_{0.80};
+    ShowcaseRenderOptions showcase_render_options_;
+    std::thread showcase_thread_;
+    std::mutex showcase_mutex_;
+    std::condition_variable showcase_cv_;
+    std::deque<CloudMsg::ConstSharedPtr> showcase_cloud_history_;
+    std::optional<ShowcaseCaptureTask> showcase_task_;
+    bool showcase_capture_queued_{false};
+    std::atomic<bool> showcase_capture_completed_{false};
 
     std::mutex stats_mutex_;
     std::deque<double> camera_age_samples_ms_;

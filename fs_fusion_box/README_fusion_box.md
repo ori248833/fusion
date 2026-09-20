@@ -629,6 +629,40 @@ visualizer_->publishFusedCones(...);
 
 可视化线程使用条件变量，没有新数据时保持睡眠，不再每 5 ms 轮询。
 
+### 一次性融合展示图
+
+`enable_showcase_capture` 与上述实时 2D 调试图相互独立。默认关闭时，
+融合节点不会订阅原始点云，也不会创建展示图渲染线程。
+
+开启示例：
+
+```yaml
+enable_showcase_capture: true
+showcase_pointcloud_topic: "/lidar_points"
+showcase_output_directory: "~/.ros/fusion_showcase"
+showcase_min_fused_cones: 3
+```
+
+开启后节点会：
+
+1. 临时保存短时间的原始 `PointCloud2` 历史；
+2. 等待至少指定数量的锥桶获得最终融合颜色；
+3. 按时间戳找到融合所用 LiDAR 检测对应的原始点云；
+4. 使用旋转三维框筛选每个锥桶内部的真实点；
+5. 生成灰色环境点云、彩色锥桶点云、半透明三维框和明亮轮廓；
+6. 保存一张高分辨率 PNG；
+7. 释放点云历史并停止额外点云订阅，不再重复渲染。
+
+展示图不包含 Track ID、IoU、置信度或统计文字。文件名使用对应 LiDAR
+时间戳，例如：
+
+```text
+fusion_effect_1788684704_031418085.png
+```
+
+若在 `showcase_capture_timeout` 时间内没有出现满足颜色数量与时间同步要求的
+帧，本次捕获会自动停止，不影响融合输出。
+
 ## 13. 参数说明
 
 ### 原有参数
@@ -665,6 +699,18 @@ visualizer_->publishFusedCones(...);
 | `enable_visualization` | `false` | 2D 可视化总开关 | 是 |
 | `visualization_every_n` | `1` | 可视化抽帧间隔 | 是 |
 | `health_log_interval` | `5.0` s | 周期健康日志间隔 | 需重启 |
+| `enable_showcase_capture` | `false` | 是否生成一次性融合展示图 | 需重启 |
+| `showcase_pointcloud_topic` | `/lidar_points` | 原始 PointCloud2 话题 | 需重启 |
+| `showcase_output_directory` | `~/.ros/fusion_showcase` | PNG 输出目录 | 需重启 |
+| `showcase_image_width/height` | `1920/1080` | 输出图片尺寸 | 需重启 |
+| `showcase_min_fused_cones` | `3` | 选择画面所需的最少已着色锥桶数 | 需重启 |
+| `showcase_capture_timeout` | `15.0` s | 等待合格画面的最长时间 | 需重启 |
+| `showcase_max_sync_diff` | `0.03` s | 点云与 LiDAR 检测允许的最大时间差 | 需重启 |
+| `showcase_cloud_history_duration` | `0.80` s | 临时点云缓存长度 | 需重启 |
+| `showcase_point_stride` | `2` | 环境点云抽样步长；锥桶框内点不抽样 | 需重启 |
+| `showcase_forward_min/max` | `-5/35` m | 展示图前后范围 | 需重启 |
+| `showcase_lateral_limit` | `15` m | 展示图左右范围 | 需重启 |
+| `showcase_height_min/max` | `-3/5` m | 展示图高度范围 | 需重启 |
 
 当前代码只有可视化相关参数注册了运行时更新回调。其他参数即使执行 `ros2 param set`，内部缓存值也不会立即改变，需要重启节点。
 

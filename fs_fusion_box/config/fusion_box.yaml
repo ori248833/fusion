@@ -32,6 +32,23 @@
     visualization_every_n: 5
     health_log_interval: 5.0
 
+    # 一次性融合展示图。false 时不订阅原始点云，也不启动渲染线程。
+    enable_showcase_capture: false
+    showcase_pointcloud_topic: "/lidar_points"
+    showcase_output_directory: "~/.ros/fusion_showcase"
+    showcase_image_width: 1920
+    showcase_image_height: 1080
+    showcase_min_fused_cones: 3
+    showcase_capture_timeout: 15.0
+    showcase_max_sync_diff: 0.03
+    showcase_cloud_history_duration: 0.80
+    showcase_point_stride: 2
+    showcase_forward_min: -5.0
+    showcase_forward_max: 35.0
+    showcase_lateral_limit: 15.0
+    showcase_height_min: -3.0
+    showcase_height_max: 5.0
+
     # CSV 调试：每帧创建子目录，并写入该帧的 fusion.csv 和 cones.csv。
     # 只记录至少成功匹配一对框的融合帧。
     enable_visual_csv: true

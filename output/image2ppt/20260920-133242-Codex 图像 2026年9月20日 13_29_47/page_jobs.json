@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "run_id": "20260920-133242-Codex 图像 2026年9月20日 13_29_47",
+  "run_status": "pages_recorded",
+  "max_concurrent_pages": 6,
+  "created_at": "2026-09-20T05:32:42Z",
+  "updated_at": "2026-09-20T05:50:13Z",
+  "pages": [
+    {
+      "page_id": "page_001",
+      "page_index": 1,
+      "status": "recorded",
+      "page_dir": "pages/page_001",
+      "source": "pages/page_001/source.png",
+      "page_request": "pages/page_001/page_request.json",
+      "manifest": "pages/page_001/manifest.json",
+      "validation": "pages/page_001/validation.json",
+      "dispatch": {
+        "agent_id": "main",
+        "agent_nickname": null,
+        "prompt": "pages/page_001/worker-prompt.md",
+        "prompt_sha256": "deb6e362967894d32a149c47f9f1c33d8f67b2db67f285210b81ddc7c6315717",
+        "page_request_sha256": "3180101cd7c31461735c6123d4f62839772b705f1f13e64a6b89c807ebb68e17",
+        "dispatched_at": "2026-09-20T05:34:27Z",
+        "execution_mode": "local"
+      },
+      "result": {
+        "agent_id": "main",
+        "record_mode": "local-main-agent",
+        "recorded_at": "2026-09-20T05:50:13Z",
+        "outputs": {
+          "page_manifest": "pages/page_001/manifest.json",
+          "imagegen_jobs": "pages/page_001/imagegen-jobs.json",
+          "page_pptx": "pages/page_001/page.pptx",
+          "preview": "pages/page_001/preview.png",
+          "contact_sheet": "pages/page_001/split_assets_contact.png",
+          "validation": "pages/page_001/validation.json",
+          "page_result": "pages/page_001/page_result.json"
+        },
+        "hashes": {
+          "page_manifest": "f3e1c128961591509b6c8cf40a4908eda82138cb0b0420af17f65c0df655f2ad",
+          "imagegen_jobs": "b0dba9b5a1159aa253ab0813af196ba5538b48512be22d01abbac32c36222fc7",
+          "page_pptx": "0c3e54fb8cd77a3ee32d67dd71b31658c532f5415159b9d3fdfa65d5a4dfcd03",
+          "preview": "0fc91e09a5aa3b7cb1687808a5ce1116d21bbc574118c2aee1e8c627622f7d6d",
+          "contact_sheet": "46d35fdc45bb02c005e53f7499498f59be2c922ef6b13264b75cb4fe0217e3eb",
+          "validation": "f57f6fc2c596800a51e136b5040da056ad2bcfa76c4dc030ef6409f3f9eec049",
+          "page_result": "948d22c96cf9aee5a056ec43ea13727467c5e2b6067ae2cb6ef6ccd0095b2ca5"
+        },
+        "validation_passed": true
+      },
+      "accepted": false
+    }
+  ]
+}

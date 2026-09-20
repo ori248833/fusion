@@ -1,0 +1,20 @@
+{
+  "schema_version": "image2ppt-visual-review-evidence-v1",
+  "pages": [
+    {
+      "page_id": "page_001",
+      "source": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\source.png",
+      "rendered": "D:\\github\\fusion\\output\\image2ppt\\20260920-133242-Codex 图像 2026年9月20日 13_29_47\\pages\\page_001\\render\\rendered.png",
+      "source_sha256": "8ed4dd7cad875953f496f2dca09e2a4a3fbdf709571945ba0ddf569a177347c0",
+      "rendered_sha256": "be99983c7d3d5bdfe6e92422fd0fb4ad0980db5e71173f5b6156b1f6fff0f406",
+      "reviewed": true,
+      "checks": {
+        "composition_layout": "The five annotation groups retain the source positions, spacing, black canvas, and large surrounding negative space.",
+        "text_content": "All sixteen source text lines were compared directly; identifiers, layer labels, confidence values, arrows, and IoU values match exactly.",
+        "object_completeness": "All five paired square nodes, five center dots, fifteen colored connectors, and sixteen text lines appear once with no duplication.",
+        "render_integrity": "The PowerPoint render is sharp at the original 1619 by 971 pixel canvas with no clipping, wrapping, missing glyphs, or bitmap background reuse.",
+        "compound_diagram": "Node counts, paired rectangle sizes, center markers, connector endpoints, colors, z-order, and straight-line geometry match the source group by group."
+      }
+    }
+  ]
+}

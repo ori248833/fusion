@@ -32,6 +32,30 @@
     # Health 汇总日志周期，单位秒；包含帧率、超时、同步差、耗时和着色率。
     health_log_interval: 5.0
 
+    # ========== 一次性融合展示图 ==========
+    # false 时完全不订阅原始点云、不创建展示图线程，实车比赛保持 false。
+    # true 时等待一帧满足条件的融合结果，保存一张 PNG 后自动停止额外处理。
+    enable_showcase_capture: false
+    showcase_pointcloud_topic: "/lidar_points"
+    showcase_output_directory: "/home/dian/DRd26_ws/showcase"
+    showcase_image_width: 1920
+    showcase_image_height: 1080
+    # 至少有几个已获得最终颜色的锥桶时才选择该帧。
+    showcase_min_fused_cones: 3
+    # 超时前没有合格帧则放弃本次捕获，不影响融合节点。
+    showcase_capture_timeout: 15.0
+    # 原始点云与用于融合的 LiDAR 检测帧最大时间差，单位秒。
+    showcase_max_sync_diff: 0.03
+    showcase_cloud_history_duration: 0.80
+    # 仅影响一次性图片；2 表示每两个点绘制一个，降低渲染时间。
+    showcase_point_stride: 2
+    # 展示图使用的 LiDAR 坐标范围，单位米（x 前向、y 横向、z 高度）。
+    showcase_forward_min: -5.0
+    showcase_forward_max: 35.0
+    showcase_lateral_limit: 15.0
+    showcase_height_min: -3.0
+    showcase_height_max: 5.0
+
     # ========== CSV 融合调试 ==========
     # 只保存至少成功匹配一对 LiDAR/YOLO 框的融合帧。
     enable_visual_csv: true
