@@ -1,5 +1,205 @@
 #include "fs_fusion_box/visualizer.hpp"
-#include <cmath>  // 需要 std::isfinite
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+
+namespace {
+
+constexpr double kLabelFontScale = 0.42;
+constexpr int kLabelThickness = 1;
+
+cv::Point rect_center(const cv::Rect& rect) {
+    return cv::Point(
+        rect.x + rect.width / 2,
+        rect.y + rect.height / 2);
+}
+
+cv::Rect camera_rect(
+    const cone_interfaces::msg::Cone& cone,
+    const cv::Size& canvas_size) {
+    cv::Rect rect(
+        cvRound(cone.center.x - cone.size.x / 2.0),
+        cvRound(cone.center.y - cone.size.y / 2.0),
+        cvRound(cone.size.x),
+        cvRound(cone.size.y));
+    return rect & cv::Rect(0, 0, canvas_size.width, canvas_size.height);
+}
+
+void draw_dashed_line(
+    cv::Mat& canvas,
+    const cv::Point& start,
+    const cv::Point& end,
+    const cv::Scalar& color,
+    int thickness = 1,
+    double dash_length = 6.0,
+    double gap_length = 4.0) {
+    const cv::Point2d delta(
+        static_cast<double>(end.x - start.x),
+        static_cast<double>(end.y - start.y));
+    const double length = std::hypot(delta.x, delta.y);
+    if (length < 1.0) {
+        return;
+    }
+
+    const cv::Point2d direction(delta.x / length, delta.y / length);
+    for (double offset = 0.0; offset < length;
+         offset += dash_length + gap_length) {
+        const double segment_end = std::min(offset + dash_length, length);
+        const cv::Point p1(
+            cvRound(start.x + direction.x * offset),
+            cvRound(start.y + direction.y * offset));
+        const cv::Point p2(
+            cvRound(start.x + direction.x * segment_end),
+            cvRound(start.y + direction.y * segment_end));
+        cv::line(canvas, p1, p2, color, thickness, cv::LINE_AA);
+    }
+}
+
+void draw_dashed_rect(
+    cv::Mat& canvas,
+    const cv::Rect& rect,
+    const cv::Scalar& color,
+    int thickness = 1) {
+    const cv::Point top_left(rect.x, rect.y);
+    const cv::Point top_right(rect.x + rect.width, rect.y);
+    const cv::Point bottom_left(rect.x, rect.y + rect.height);
+    const cv::Point bottom_right(
+        rect.x + rect.width, rect.y + rect.height);
+    draw_dashed_line(canvas, top_left, top_right, color, thickness);
+    draw_dashed_line(canvas, top_right, bottom_right, color, thickness);
+    draw_dashed_line(canvas, bottom_right, bottom_left, color, thickness);
+    draw_dashed_line(canvas, bottom_left, top_left, color, thickness);
+}
+
+int overlap_area(
+    const cv::Rect& candidate,
+    const std::vector<cv::Rect>& occupied) {
+    int area = 0;
+    for (const auto& rect : occupied) {
+        area += (candidate & rect).area();
+    }
+    return area;
+}
+
+cv::Rect draw_label(
+    cv::Mat& canvas,
+    const std::string& text,
+    const cv::Rect& anchor,
+    bool prefer_above,
+    const cv::Scalar& foreground,
+    std::vector<cv::Rect>& occupied) {
+    int baseline = 0;
+    const cv::Size text_size = cv::getTextSize(
+        text,
+        cv::FONT_HERSHEY_SIMPLEX,
+        kLabelFontScale,
+        kLabelThickness,
+        &baseline);
+    const int width = text_size.width + 8;
+    const int height = text_size.height + baseline + 6;
+    const int gap = 3;
+
+    std::vector<cv::Point> origins;
+    origins.reserve(6);
+    if (prefer_above) {
+        origins.emplace_back(anchor.x, anchor.y - height - gap);
+        origins.emplace_back(
+            anchor.x + anchor.width - width,
+            anchor.y - height - gap);
+        origins.emplace_back(anchor.x, anchor.y + anchor.height + gap);
+        origins.emplace_back(
+            anchor.x + anchor.width - width,
+            anchor.y + anchor.height + gap);
+    } else {
+        origins.emplace_back(anchor.x, anchor.y + anchor.height + gap);
+        origins.emplace_back(
+            anchor.x + anchor.width - width,
+            anchor.y + anchor.height + gap);
+        origins.emplace_back(anchor.x, anchor.y - height - gap);
+        origins.emplace_back(
+            anchor.x + anchor.width - width,
+            anchor.y - height - gap);
+    }
+    origins.emplace_back(anchor.x + anchor.width + gap, anchor.y);
+    origins.emplace_back(anchor.x - width - gap, anchor.y);
+
+    cv::Rect best;
+    int best_score = std::numeric_limits<int>::max();
+    for (size_t i = 0; i < origins.size(); ++i) {
+        const int x = std::clamp(
+            origins[i].x, 0, std::max(0, canvas.cols - width));
+        const int y = std::clamp(
+            origins[i].y, 0, std::max(0, canvas.rows - height));
+        const cv::Rect candidate(x, y, width, height);
+        const int score = overlap_area(candidate, occupied) * 100 +
+                          static_cast<int>(i);
+        if (score < best_score) {
+            best = candidate;
+            best_score = score;
+        }
+    }
+
+    cv::rectangle(canvas, best, cv::Scalar(24, 24, 24), cv::FILLED);
+    cv::rectangle(canvas, best, foreground, 1, cv::LINE_AA);
+    cv::putText(
+        canvas,
+        text,
+        cv::Point(best.x + 4, best.y + 3 + text_size.height),
+        cv::FONT_HERSHEY_SIMPLEX,
+        kLabelFontScale,
+        foreground,
+        kLabelThickness,
+        cv::LINE_AA);
+    occupied.push_back(best);
+    return best;
+}
+
+std::string format_track_id(uint64_t track_id) {
+    return track_id == 0 ? "T--" : "T" + std::to_string(track_id);
+}
+
+std::string format_timestamp(const builtin_interfaces::msg::Time& stamp) {
+    std::ostringstream stream;
+    stream << "Time " << stamp.sec << '.' << std::setfill('0')
+           << std::setw(9) << stamp.nanosec;
+    return stream.str();
+}
+
+std::string color_name(uint8_t color) {
+    switch (color) {
+        case drd25_msgs::msg::Cone::BLUE:
+            return "Blue";
+        case drd25_msgs::msg::Cone::RED:
+            return "Red";
+        case drd25_msgs::msg::Cone::YELLOW_BIG:
+            return "Yellow-L";
+        case drd25_msgs::msg::Cone::YELLOW_SMALL:
+            return "Yellow-S";
+        case drd25_msgs::msg::Cone::UNKNOWN_BIG:
+            return "Unknown-L";
+        case drd25_msgs::msg::Cone::UNKNOWN_SMALL:
+            return "Unknown-S";
+        default:
+            return "Unknown";
+    }
+}
+
+std::string decision_tag(const std::string& decision, bool matched) {
+    if (decision.find("沿用历史颜色") != std::string::npos) {
+        return " H";
+    }
+    if (decision.find("颜色冲突") != std::string::npos) {
+        return " !";
+    }
+    if (!matched) {
+        return " U";
+    }
+    return "";
+}
+
+}  // namespace
 
 namespace fs_fusion_box {
 
@@ -122,7 +322,12 @@ void Visualizer::publishFusedCones(
 void Visualizer::publishSyntheticView(
     const cone_interfaces::msg::ConeArray::ConstSharedPtr& camera_msg,
     const lidar_cone_detector::msg::ThreeDConeArray::ConstSharedPtr& lidar_msg,
-    const CalibrationParams& params)
+    const CalibrationParams& params,
+    const std::vector<ProjectedBox>& projected_boxes,
+    const std::vector<FusionMatch>& matches,
+    const std::vector<uint64_t>& track_ids,
+    const std::vector<uint8_t>& final_colors,
+    const std::vector<std::string>& decisions)
 {
     // ---------- 防御1：lidar_msg 不能为空 ----------
     if (!lidar_msg) {
@@ -140,105 +345,176 @@ void Visualizer::publishSyntheticView(
     }
 
     cv::Mat canvas = cv::Mat::zeros(params.img_h, params.img_w, CV_8UC3);
+    const cv::Size canvas_size(canvas.cols, canvas.rows);
+    const cv::Scalar camera_color(0, 255, 0);
+    const cv::Scalar lidar_color(255, 128, 0);
+    const cv::Scalar unmatched_color(0, 165, 255);
+    const cv::Scalar link_color(210, 210, 210);
 
-    // ============================================================
-    // 【核心修改】YOLO 框：只有 camera_msg 非空时才绘制
-    // ============================================================
-    if (camera_msg) {
-        for (const auto& cone : camera_msg->cones) {
-            cv::Point top_left(
-                cone.center.x - cone.size.x / 2.0,
-                cone.center.y - cone.size.y / 2.0
-            );
-            cv::Point bottom_right(
-                cone.center.x + cone.size.x / 2.0,
-                cone.center.y + cone.size.y / 2.0
-            );
-
-            cv::rectangle(canvas, top_left, bottom_right, cv::Scalar(0, 255, 0), 2);
-            
-            std::string label = "YOLO " + std::to_string(int(cone.confidence * 100)) + "%";
-            cv::putText(canvas, label, cv::Point(top_left.x, top_left.y - 5), 
-                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
+    const size_t lidar_count = lidar_msg->cones.size();
+    const size_t camera_count = camera_msg ? camera_msg->cones.size() : 0;
+    std::vector<cv::Rect> lidar_rects(lidar_count);
+    std::vector<bool> lidar_rect_valid(lidar_count, false);
+    for (const auto& projected_box : projected_boxes) {
+        if (!projected_box.valid ||
+            projected_box.original_index < 0 ||
+            static_cast<size_t>(projected_box.original_index) >= lidar_count) {
+            continue;
         }
-    } else {
-        // 可选：在图像上显示"无相机数据"提示
-        cv::putText(canvas, "No Camera Data", cv::Point(10, 30), 
-            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2);
+        const size_t lidar_index =
+            static_cast<size_t>(projected_box.original_index);
+        const cv::Rect clipped = projected_box.rect &
+            cv::Rect(0, 0, canvas.cols, canvas.rows);
+        if (clipped.area() > 0) {
+            lidar_rects[lidar_index] = clipped;
+            lidar_rect_valid[lidar_index] = true;
+        }
     }
 
-    // ============================================================
-    // 雷达投影框（lidar_msg 已确保非空）
-    // ============================================================
-    for (const auto& detection : lidar_msg->cones) {
-        double cx = detection.center.x; 
-        double cy = detection.center.y; 
-        double cz = detection.center.z;
-        double dx = detection.size.x / 2.0; 
-        double dy = detection.size.y / 2.0; 
-        double dz = detection.size.z / 2.0;
-
-        double yaw = detection.yaw;
-        
-        Eigen::Matrix3d rot_z;
-        rot_z << cos(yaw), -sin(yaw), 0,
-                sin(yaw),  cos(yaw), 0,
-                0,        0,        1;
-
-        std::vector<cv::Point3f> object_points;
-        int signs[8][3] = {
-            {1,1,1}, {1,1,-1}, {1,-1,1}, {1,-1,-1},
-            {-1,1,1}, {-1,1,-1}, {-1,-1,1}, {-1,-1,-1}
-        };
-
-        for(int k=0; k<8; ++k) {
-            Eigen::Vector3d pt_raw(
-                signs[k][0]*dx, 
-                signs[k][1]*dy, 
-                signs[k][2]*dz
-            );
-            Eigen::Vector3d pt_rot = rot_z * pt_raw;
-            object_points.push_back(cv::Point3f(
-                cx + pt_rot.x(), 
-                cy + pt_rot.y(), 
-                cz + pt_rot.z()
-            ));
+    std::vector<cv::Rect> camera_rects(camera_count);
+    std::vector<bool> camera_rect_valid(camera_count, false);
+    if (camera_msg) {
+        for (size_t i = 0; i < camera_count; ++i) {
+            camera_rects[i] = camera_rect(camera_msg->cones[i], canvas_size);
+            camera_rect_valid[i] = camera_rects[i].area() > 0;
         }
+    }
 
-        std::vector<cv::Point2f> image_points;
-        bool all_points_valid = true;
-        for(const auto& pt3 : object_points) {
-            Eigen::Vector4d pt_l(pt3.x, pt3.y, pt3.z, 1.0);
-            Eigen::Vector4d pt_c_eigen = params.T_l2c * pt_l;
-            cv::Point3f pt_c(pt_c_eigen.x(), pt_c_eigen.y(), pt_c_eigen.z());
-
-            if (pt_c.z <= 0.1) { 
-                all_points_valid = false; 
-                break; 
-            }
-            
-            double u = (pt_c.x * params.K.at<double>(0,0) / pt_c.z) + params.K.at<double>(0,2);
-            double v = (pt_c.y * params.K.at<double>(1,1) / pt_c.z) + params.K.at<double>(1,2);
-            
-            // ---------- 防御：检查 u/v 是否有效 ----------
-            if (!std::isfinite(u) || !std::isfinite(v)) {
-                all_points_valid = false;
-                break;
-            }
-            
-            image_points.push_back(cv::Point2f(u, v));
+    std::vector<int> lidar_to_camera(lidar_count, -1);
+    std::vector<int> camera_to_lidar(camera_count, -1);
+    std::vector<double> lidar_iou(lidar_count, 0.0);
+    for (const auto& match : matches) {
+        if (match.lidar_index >= lidar_count ||
+            match.camera_index >= camera_count) {
+            continue;
         }
+        lidar_to_camera[match.lidar_index] =
+            static_cast<int>(match.camera_index);
+        camera_to_lidar[match.camera_index] =
+            static_cast<int>(match.lidar_index);
+        lidar_iou[match.lidar_index] = match.iou;
+    }
 
-        if (!all_points_valid || image_points.empty()) continue;
-
-        cv::Rect rect = cv::boundingRect(image_points);
-        rect = rect & cv::Rect(0, 0, canvas.cols, canvas.rows); 
-        
-        if (rect.area() > 0) {
-            cv::rectangle(canvas, rect, cv::Scalar(255, 0, 0), 2);
-            cv::putText(canvas, "Lidar", cv::Point(rect.x, rect.y + rect.height + 15), 
-                cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 0, 0), 1);
+    // Draw association lines first so boxes and text stay visually dominant.
+    for (size_t lidar_index = 0; lidar_index < lidar_count; ++lidar_index) {
+        const int camera_index = lidar_to_camera[lidar_index];
+        if (camera_index < 0 || !lidar_rect_valid[lidar_index] ||
+            !camera_rect_valid[static_cast<size_t>(camera_index)]) {
+            continue;
         }
+        cv::line(
+            canvas,
+            rect_center(lidar_rects[lidar_index]),
+            rect_center(camera_rects[static_cast<size_t>(camera_index)]),
+            link_color,
+            1,
+            cv::LINE_AA);
+    }
+
+    for (size_t i = 0; i < camera_count; ++i) {
+        if (!camera_rect_valid[i]) {
+            continue;
+        }
+        if (camera_to_lidar[i] >= 0) {
+            cv::rectangle(canvas, camera_rects[i], camera_color, 2, cv::LINE_AA);
+        } else {
+            draw_dashed_rect(canvas, camera_rects[i], unmatched_color, 1);
+        }
+    }
+    for (size_t i = 0; i < lidar_count; ++i) {
+        if (!lidar_rect_valid[i]) {
+            continue;
+        }
+        if (lidar_to_camera[i] >= 0) {
+            cv::rectangle(canvas, lidar_rects[i], lidar_color, 2, cv::LINE_AA);
+        } else {
+            draw_dashed_rect(canvas, lidar_rects[i], lidar_color, 1);
+        }
+    }
+
+    std::vector<cv::Rect> occupied;
+    occupied.reserve(lidar_count + camera_count + matches.size() + 1);
+    draw_label(
+        canvas,
+        format_timestamp(lidar_msg->header.stamp),
+        cv::Rect(8, 0, 1, 1),
+        false,
+        cv::Scalar(235, 235, 235),
+        occupied);
+    occupied.insert(occupied.end(), lidar_rects.begin(), lidar_rects.end());
+    occupied.insert(occupied.end(), camera_rects.begin(), camera_rects.end());
+
+    for (size_t i = 0; i < camera_count; ++i) {
+        if (!camera_rect_valid[i]) {
+            continue;
+        }
+        uint64_t track_id = 0;
+        const int lidar_index = camera_to_lidar[i];
+        if (lidar_index >= 0 &&
+            static_cast<size_t>(lidar_index) < track_ids.size()) {
+            track_id = track_ids[static_cast<size_t>(lidar_index)];
+        }
+        std::ostringstream label;
+        label << format_track_id(track_id) << " Y" << i + 1
+              << " C" << std::fixed << std::setprecision(2)
+              << camera_msg->cones[i].confidence;
+        draw_label(
+            canvas,
+            label.str(),
+            camera_rects[i],
+            true,
+            camera_to_lidar[i] >= 0 ? camera_color : unmatched_color,
+            occupied);
+    }
+
+    for (size_t i = 0; i < lidar_count; ++i) {
+        if (!lidar_rect_valid[i]) {
+            continue;
+        }
+        const uint64_t track_id = i < track_ids.size() ? track_ids[i] : 0;
+        const uint8_t final_color = i < final_colors.size()
+            ? final_colors[i]
+            : drd25_msgs::msg::Cone::UNKNOWN;
+        const bool matched = lidar_to_camera[i] >= 0;
+        const std::string decision = i < decisions.size()
+            ? decisions[i]
+            : std::string();
+        std::ostringstream label;
+        label << format_track_id(track_id) << " L" << i + 1 << ' '
+              << color_name(final_color)
+              << decision_tag(decision, matched);
+        draw_label(
+            canvas,
+            label.str(),
+            lidar_rects[i],
+            false,
+            lidar_color,
+            occupied);
+    }
+
+    for (size_t lidar_index = 0; lidar_index < lidar_count; ++lidar_index) {
+        const int camera_index = lidar_to_camera[lidar_index];
+        if (camera_index < 0 || !lidar_rect_valid[lidar_index] ||
+            !camera_rect_valid[static_cast<size_t>(camera_index)]) {
+            continue;
+        }
+        const cv::Point lidar_center = rect_center(lidar_rects[lidar_index]);
+        const cv::Point yolo_center =
+            rect_center(camera_rects[static_cast<size_t>(camera_index)]);
+        const cv::Point midpoint(
+            (lidar_center.x + yolo_center.x) / 2,
+            (lidar_center.y + yolo_center.y) / 2);
+        std::ostringstream label;
+        label << "L" << lidar_index + 1 << "<->Y" << camera_index + 1
+              << " IoU " << std::fixed << std::setprecision(2)
+              << lidar_iou[lidar_index];
+        draw_label(
+            canvas,
+            label.str(),
+            cv::Rect(midpoint.x, midpoint.y, 1, 1),
+            true,
+            link_color,
+            occupied);
     }
 
     // ---------- 发布图像 ----------

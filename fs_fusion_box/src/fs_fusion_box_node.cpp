@@ -183,6 +183,11 @@ private:
     struct VisualizationData {
         LidarMsg::ConstSharedPtr lidar_msg;
         CameraMsg::ConstSharedPtr camera_msg;
+        std::vector<ProjectedBox> projected_boxes;
+        std::vector<FusionMatch> matches;
+        std::vector<uint64_t> track_ids;
+        std::vector<uint8_t> final_colors;
+        std::vector<std::string> decisions;
     };
 
     struct TrackCandidate {
@@ -563,7 +568,7 @@ private:
                 standard_camera,
                 overlap_threshold_);
 
-            const ColorUpdateSnapshot color_snapshot = update_track_colors(
+            ColorUpdateSnapshot color_snapshot = update_track_colors(
                 task.lidar_frame,
                 fusion_result.fused_cones,
                 stamp_to_sec(task.camera_msg->header.stamp));
@@ -584,7 +589,12 @@ private:
 
             maybe_queue_csv_frame(
                 task, fusion_result, color_snapshot);
-            maybe_queue_visualization(task);
+            maybe_queue_visualization(
+                task,
+                std::move(projected_boxes),
+                std::move(fusion_result.matches),
+                std::move(color_snapshot.colors),
+                std::move(color_snapshot.decisions));
         }
     }
 
@@ -1000,7 +1010,12 @@ private:
         }
     }
 
-    void maybe_queue_visualization(const FusionTask& task) {
+    void maybe_queue_visualization(
+        const FusionTask& task,
+        std::vector<ProjectedBox> projected_boxes,
+        std::vector<FusionMatch> matches,
+        std::vector<uint8_t> final_colors,
+        std::vector<std::string> decisions) {
         if (!enable_visualization_.load(std::memory_order_relaxed)) {
             return;
         }
@@ -1017,7 +1032,13 @@ private:
         {
             std::lock_guard<std::mutex> lock(visualization_mutex_);
             latest_visualization_ = VisualizationData{
-                task.lidar_frame.msg, task.camera_msg};
+                task.lidar_frame.msg,
+                task.camera_msg,
+                std::move(projected_boxes),
+                std::move(matches),
+                task.lidar_frame.track_ids,
+                std::move(final_colors),
+                std::move(decisions)};
         }
         visualization_cv_.notify_one();
     }
@@ -1045,7 +1066,14 @@ private:
             // 3D visualization was intentionally removed. Only the existing
             // synthetic 2D view remains.
             visualizer_->publishSyntheticView(
-                data->camera_msg, data->lidar_msg, params_);
+                data->camera_msg,
+                data->lidar_msg,
+                params_,
+                data->projected_boxes,
+                data->matches,
+                data->track_ids,
+                data->final_colors,
+                data->decisions);
         }
     }
 

@@ -10,6 +10,7 @@
 #include <sensor_msgs/msg/image.hpp> 
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>     
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <set>
@@ -42,7 +43,12 @@ public:
     void publishSyntheticView(
         const cone_interfaces::msg::ConeArray::ConstSharedPtr& camera_msg,
         const lidar_cone_detector::msg::ThreeDConeArray::ConstSharedPtr& lidar_msg,
-        const CalibrationParams& params
+        const CalibrationParams& params,
+        const std::vector<ProjectedBox>& projected_boxes,
+        const std::vector<FusionMatch>& matches,
+        const std::vector<uint64_t>& track_ids,
+        const std::vector<uint8_t>& final_colors,
+        const std::vector<std::string>& decisions
     );
 
 private:

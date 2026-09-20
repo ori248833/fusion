@@ -161,7 +161,15 @@ std::vector<size_t> unmatched_camera_indices;
 `Visualizer` 仍需提供：
 
 ```cpp
-publishSyntheticView(camera_msg, lidar_msg, params);
+publishSyntheticView(
+    camera_msg,
+    lidar_msg,
+    params,
+    projected_boxes,
+    matches,
+    track_ids,
+    final_colors,
+    decisions);
 ```
 
 节点已经不再调用：
@@ -598,6 +606,20 @@ ros2 param set /fusion_box_node visualization_every_n 5
 ```cpp
 visualizer_->publishSyntheticView(...);
 ```
+
+黑色画布上的逐目标信息包括：
+
+- LiDAR 帧时间戳；
+- 每个 LiDAR/YOLO 框对应的 Track ID；
+- LiDAR 编号与 YOLO 编号；
+- 最终融合颜色；
+- YOLO 置信度；
+- 匹配对的实际 IoU；
+- 匹配框中心之间的关联线；
+- 历史颜色、颜色冲突和未匹配的紧凑状态标记。
+
+可视化直接复用融合计算使用的 `projected_boxes` 和 `matches`，不再单独
+重复计算 LiDAR 投影，因此显示结果与实际匹配逻辑保持一致。
 
 以下 3D 可视化已经从节点调用链删除：
 
