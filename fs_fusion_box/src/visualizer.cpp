@@ -7,8 +7,10 @@
 
 namespace {
 
-constexpr double kLabelFontScale = 0.42;
+constexpr double kObjectLabelFontScale = 0.35;
+constexpr double kTimestampFontScale = 0.42;
 constexpr int kLabelThickness = 1;
+constexpr int kLabelOutlineThickness = 3;
 
 cv::Point rect_center(const cv::Rect& rect) {
     return cv::Point(
@@ -89,12 +91,13 @@ cv::Rect draw_label(
     const cv::Rect& anchor,
     bool prefer_above,
     const cv::Scalar& foreground,
+    double font_scale,
     std::vector<cv::Rect>& occupied) {
     int baseline = 0;
     const cv::Size text_size = cv::getTextSize(
         text,
         cv::FONT_HERSHEY_SIMPLEX,
-        kLabelFontScale,
+        font_scale,
         kLabelThickness,
         &baseline);
     const int width = text_size.width + 8;
@@ -141,14 +144,24 @@ cv::Rect draw_label(
         }
     }
 
-    cv::rectangle(canvas, best, cv::Scalar(24, 24, 24), cv::FILLED);
-    cv::rectangle(canvas, best, foreground, 1, cv::LINE_AA);
+    const cv::Point text_origin(
+        best.x + 4,
+        best.y + 3 + text_size.height);
     cv::putText(
         canvas,
         text,
-        cv::Point(best.x + 4, best.y + 3 + text_size.height),
+        text_origin,
         cv::FONT_HERSHEY_SIMPLEX,
-        kLabelFontScale,
+        font_scale,
+        cv::Scalar(0, 0, 0),
+        kLabelOutlineThickness,
+        cv::LINE_AA);
+    cv::putText(
+        canvas,
+        text,
+        text_origin,
+        cv::FONT_HERSHEY_SIMPLEX,
+        font_scale,
         foreground,
         kLabelThickness,
         cv::LINE_AA);
@@ -440,6 +453,7 @@ void Visualizer::publishSyntheticView(
         cv::Rect(8, 0, 1, 1),
         false,
         cv::Scalar(235, 235, 235),
+        kTimestampFontScale,
         occupied);
     occupied.insert(occupied.end(), lidar_rects.begin(), lidar_rects.end());
     occupied.insert(occupied.end(), camera_rects.begin(), camera_rects.end());
@@ -464,6 +478,7 @@ void Visualizer::publishSyntheticView(
             camera_rects[i],
             true,
             camera_to_lidar[i] >= 0 ? camera_color : unmatched_color,
+            kObjectLabelFontScale,
             occupied);
     }
 
@@ -489,6 +504,7 @@ void Visualizer::publishSyntheticView(
             lidar_rects[i],
             false,
             lidar_color,
+            kObjectLabelFontScale,
             occupied);
     }
 
@@ -514,6 +530,7 @@ void Visualizer::publishSyntheticView(
             cv::Rect(midpoint.x, midpoint.y, 1, 1),
             true,
             link_color,
+            kObjectLabelFontScale,
             occupied);
     }
 
