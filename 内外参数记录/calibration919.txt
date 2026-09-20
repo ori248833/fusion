@@ -1,0 +1,37 @@
+# Camera intrinsics and LiDAR-to-Camera extrinsics
+
+[ImageSize]
+# MATLAB cameraIntrinsics order: [height, width]
+720 1280
+
+[FocalLength]
+529.5970 529.7075
+
+[PrincipalPoint]
+620.6926 344.6861
+
+[CameraMatrix_K]
+529.5970 0.0000 620.6926
+0.0000 529.7075 344.6861
+0.0000 0.0000 1.0000
+
+[RadialDistortion]
+0.00070521 0.0013
+
+[TangentialDistortion]
+0.0000 0.0000
+
+[DistortionCoefficients_k1_k2_p1_p2_k3]
+0.00070521 0.0013 0.0000 0.0000 0.0000
+
+[Skew]
+0.0000
+
+[LiDAR_to_Camera_4x4]
+-0.0033 -1.0000 -0.0025 0.0306
+0.0107 0.0024 -0.9999 0.0124
+0.9999 -0.0033 0.0107 0.0099
+0.0000 0.0000 0.0000 1.0000
+
+[Translation_m]
+0.0306 0.0124 0.0099
