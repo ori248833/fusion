@@ -629,7 +629,7 @@ visualizer_->publishFusedCones(...);
 
 可视化线程使用条件变量，没有新数据时保持睡眠，不再每 5 ms 轮询。
 
-### 一次性融合展示图
+### 连续融合展示图
 
 `enable_showcase_capture` 与上述实时 2D 调试图相互独立。默认关闭时，
 融合节点不会订阅原始点云，也不会创建展示图渲染线程。
@@ -640,28 +640,30 @@ visualizer_->publishFusedCones(...);
 enable_showcase_capture: true
 showcase_pointcloud_topic: "/lidar_points"
 showcase_output_directory: "~/.ros/fusion_showcase"
-showcase_min_fused_cones: 3
+showcase_min_fused_cones: 1
 ```
 
 开启后节点会：
 
 1. 临时保存短时间的原始 `PointCloud2` 历史；
-2. 等待至少指定数量的锥桶获得最终融合颜色；
+2. 每当当前帧至少存在指定数量的真实 LiDAR↔YOLO 匹配时触发；
 3. 按时间戳找到融合所用 LiDAR 检测对应的原始点云；
 4. 使用旋转三维框筛选每个锥桶内部的真实点；
 5. 生成灰色环境点云、彩色锥桶点云、半透明三维框和明亮轮廓；
-6. 保存一张高分辨率 PNG；
-7. 释放点云历史并停止额外点云订阅，不再重复渲染。
+6. 将该帧加入后台写图队列并保存独立 PNG；
+7. 继续等待并保存下一帧，直到节点停止。
 
-展示图不包含 Track ID、IoU、置信度或统计文字。文件名使用对应 LiDAR
-时间戳，例如：
+展示图不包含 Track ID、IoU、置信度或统计文字。每次启动都会创建独立的
+`fusion_showcase_日期_时间` 目录；文件名包含顺序号、LiDAR 时间戳和 Camera
+时间戳，不会互相覆盖，例如：
 
 ```text
-fusion_effect_1788684704_031418085.png
+fusion_effect_000001_lidar_1788684704_031418085_camera_1788684704_032001000.png
 ```
 
-若在 `showcase_capture_timeout` 时间内没有出现满足颜色数量与时间同步要求的
-帧，本次捕获会自动停止，不影响融合输出。
+写图线程不会阻塞 LiDAR Map 发布。节点退出时会把已经进入展示图队列的帧
+写完再停止。连续保存 1920×1080 PNG 会消耗较多磁盘；若渲染速度低于融合
+帧率，队列会保留所有待保存帧并输出积压警告。
 
 ## 13. 参数说明
 
@@ -699,12 +701,11 @@ fusion_effect_1788684704_031418085.png
 | `enable_visualization` | `false` | 2D 可视化总开关 | 是 |
 | `visualization_every_n` | `1` | 可视化抽帧间隔 | 是 |
 | `health_log_interval` | `5.0` s | 周期健康日志间隔 | 需重启 |
-| `enable_showcase_capture` | `false` | 是否生成一次性融合展示图 | 需重启 |
+| `enable_showcase_capture` | `false` | 是否连续保存满足条件的融合展示图 | 需重启 |
 | `showcase_pointcloud_topic` | `/lidar_points` | 原始 PointCloud2 话题 | 需重启 |
 | `showcase_output_directory` | `~/.ros/fusion_showcase` | PNG 输出目录 | 需重启 |
 | `showcase_image_width/height` | `1920/1080` | 输出图片尺寸 | 需重启 |
-| `showcase_min_fused_cones` | `3` | 选择画面所需的最少已着色锥桶数 | 需重启 |
-| `showcase_capture_timeout` | `15.0` s | 等待合格画面的最长时间 | 需重启 |
+| `showcase_min_fused_cones` | `1` | 每帧触发保存所需的当前真实匹配数 | 需重启 |
 | `showcase_max_sync_diff` | `0.03` s | 点云与 LiDAR 检测允许的最大时间差 | 需重启 |
 | `showcase_cloud_history_duration` | `0.80` s | 临时点云缓存长度 | 需重启 |
 | `showcase_point_stride` | `2` | 环境点云抽样步长；锥桶框内点不抽样 | 需重启 |
