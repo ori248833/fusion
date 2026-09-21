@@ -93,8 +93,16 @@ class YOLOConeDetector(Node):
                 Image, image_topic, self.image_only_callback, latest_only_qos
             )
 
+        # Use a reliable QoS for the debug stream so RViz2 and other generic
+        # image viewers can subscribe without requiring a manual Best Effort
+        # QoS override. The input and detection topics remain Best Effort.
+        debug_image_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+        )
         self.debug_image_pub = self.create_publisher(
-            Image, '/yolo/debug_image', latest_only_qos
+            Image, '/yolo/debug_image', debug_image_qos
         )
         self.cone_pub = self.create_publisher(
             ConeArray, '/yolo/cones', latest_only_qos
@@ -169,11 +177,10 @@ class YOLOConeDetector(Node):
         return True
 
     def _wants_debug_image(self) -> bool:
-        if not self.enable_visualization:
-            return False
-        if self.frame_count % self.debug_image_every_n != 0:
-            return False
-        return self.debug_image_pub.get_subscription_count() > 0
+        return (
+            self.enable_visualization
+            and self.frame_count % self.debug_image_every_n == 0
+        )
 
     def _maybe_log_detected(self, detected_count: int) -> None:
         if detected_count <= 0 or self.detect_log_interval <= 0:
