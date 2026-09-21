@@ -4,7 +4,6 @@
 #include <array>
 #include <cmath>
 #include <limits>
-#include <numeric>
 #include <stdexcept>
 
 #include <Eigen/Dense>
@@ -47,17 +46,12 @@ struct CameraModel {
     double offset_y{0.0};
 };
 
-constexpr std::array<std::array<int, 2>, 12> kBoxEdges{{
-    {{0, 1}}, {{1, 2}}, {{2, 3}}, {{3, 0}},
-    {{4, 5}}, {{5, 6}}, {{6, 7}}, {{7, 4}},
-    {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
-}};
-
-constexpr std::array<std::array<int, 4>, 6> kBoxFaces{{
-    {{0, 1, 2, 3}}, {{4, 5, 6, 7}},
-    {{0, 1, 5, 4}}, {{1, 2, 6, 5}},
-    {{2, 3, 7, 6}}, {{3, 0, 4, 7}},
-}};
+bool is_confirmed_color(uint8_t color) {
+    return color == drd25_msgs::msg::Cone::BLUE ||
+           color == drd25_msgs::msg::Cone::RED ||
+           color == drd25_msgs::msg::Cone::YELLOW_BIG ||
+           color == drd25_msgs::msg::Cone::YELLOW_SMALL;
+}
 
 cv::Scalar cone_color(uint8_t color) {
     switch (color) {
@@ -301,6 +295,9 @@ bool render_showcase_image(
             sample.position = Eigen::Vector3d(x, y, z);
             for (std::size_t cone_index = 0;
                  cone_index < cones.size(); ++cone_index) {
+                if (!is_confirmed_color(cones[cone_index].color)) {
+                    continue;
+                }
                 if (point_inside_box(sample.position, cones[cone_index])) {
                     sample.cone_index = static_cast<int>(cone_index);
                     break;
@@ -346,41 +343,17 @@ bool render_showcase_image(
             const double fade = std::clamp(
                 1.0 - point.depth / 80.0, 0.25, 1.0);
             const uint8_t gray = static_cast<uint8_t>(45.0 + 75.0 * fade);
-            image.at<cv::Vec3b>(point.pixel) = cv::Vec3b(gray, gray, gray);
+            cv::circle(
+                image,
+                point.pixel,
+                2,
+                cv::Scalar(gray, gray, gray),
+                cv::FILLED,
+                cv::LINE_AA);
             ++stats.rendered_points;
         }
 
-        cv::Mat box_overlay = image.clone();
-        std::vector<std::array<ProjectedCorner, 8>> projected_boxes;
-        projected_boxes.reserve(cones.size());
-        for (const auto& cone : cones) {
-            std::array<ProjectedCorner, 8> projected;
-            const auto corners = box_corners(cone);
-            bool all_valid = true;
-            for (std::size_t i = 0; i < corners.size(); ++i) {
-                projected[i] = project_point(
-                    corners[i], camera, image.cols, image.rows);
-                all_valid = all_valid && projected[i].valid;
-            }
-            projected_boxes.push_back(projected);
-            if (!all_valid) {
-                continue;
-            }
-            const cv::Scalar color = cone_color(cone.color);
-            for (const auto& face : kBoxFaces) {
-                std::vector<cv::Point> polygon;
-                polygon.reserve(face.size());
-                for (const int corner_index : face) {
-                    polygon.push_back(projected[corner_index].pixel);
-                }
-                cv::fillConvexPoly(
-                    box_overlay, polygon, color, cv::LINE_AA);
-            }
-            ++stats.rendered_cones;
-        }
-        cv::addWeighted(box_overlay, 0.18, image, 0.82, 0.0, image);
-
-        cv::Mat glow_overlay = image.clone();
+        std::vector<bool> rendered_cones(cones.size(), false);
         for (const auto& point : points) {
             if (point.cone_index < 0 || point.depth <= 0.05 ||
                 point.pixel.x < 0 || point.pixel.x >= image.cols ||
@@ -389,44 +362,13 @@ bool render_showcase_image(
             }
             const auto cone_index = static_cast<std::size_t>(point.cone_index);
             const cv::Scalar color = cone_color(cones[cone_index].color);
-            cv::circle(
-                glow_overlay, point.pixel, 4, color, cv::FILLED, cv::LINE_AA);
-        }
-        cv::addWeighted(glow_overlay, 0.16, image, 0.84, 0.0, image);
-        for (const auto& point : points) {
-            if (point.cone_index < 0 || point.depth <= 0.05 ||
-                point.pixel.x < 0 || point.pixel.x >= image.cols ||
-                point.pixel.y < 0 || point.pixel.y >= image.rows) {
-                continue;
-            }
-            const auto cone_index = static_cast<std::size_t>(point.cone_index);
-            const cv::Scalar color = cone_color(cones[cone_index].color);
-            cv::circle(image, point.pixel, 2, color, cv::FILLED, cv::LINE_AA);
+            cv::circle(image, point.pixel, 5, color, cv::FILLED, cv::LINE_AA);
+            rendered_cones[cone_index] = true;
             ++stats.colored_points;
             ++stats.rendered_points;
         }
-
-        for (std::size_t cone_index = 0;
-             cone_index < cones.size(); ++cone_index) {
-            const auto& projected = projected_boxes[cone_index];
-            if (!std::all_of(
-                    projected.begin(), projected.end(),
-                    [](const ProjectedCorner& corner) {
-                        return corner.valid;
-                    })) {
-                continue;
-            }
-            const cv::Scalar color = cone_color(cones[cone_index].color);
-            for (const auto& edge : kBoxEdges) {
-                cv::line(
-                    image,
-                    projected[edge[0]].pixel,
-                    projected[edge[1]].pixel,
-                    color,
-                    2,
-                    cv::LINE_AA);
-            }
-        }
+        stats.rendered_cones = static_cast<std::size_t>(std::count(
+            rendered_cones.begin(), rendered_cones.end(), true));
 
         const std::filesystem::path parent = output_path.parent_path();
         if (!parent.empty()) {
