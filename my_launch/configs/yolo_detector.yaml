@@ -27,8 +27,12 @@
     debug_image_every_n: 1
     # 每检测到 N 帧目标时打印一次数量日志；0 表示关闭。
     detect_log_interval: 0
-    # 是否输出图像转换、推理、GPU→CPU 提取、发布和总耗时。
-    # 调试延迟时开启，比赛时建议关闭。
+    # 是否统计相机时间戳到回调、图像转换、model()、GPU→CPU 提取和总延迟。
+    # 每帧只记录数字，达到下方间隔后才汇总打印，测量期间可保持开启。
     enable_timing: true
-    # enable_timing=true 时，每处理 N 帧输出一次 timing 日志。
-    timing_log_interval: 30
+    # 每处理 N 帧输出一次最近窗口的 p50/p95/max。
+    timing_log_interval: 100
+    # 用最近多少个已处理帧计算统计值；100 帧约等于 20 Hz 下的 5 秒。
+    timing_window_size: 100
+    # 前 N 个已处理帧用于模型和 CUDA 预热，不计入延迟统计。
+    timing_warmup_frames: 10

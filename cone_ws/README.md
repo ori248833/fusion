@@ -137,6 +137,20 @@ ros2 run cone_detector yolo_detector --ros-args \
 - 只要锥桶结果更快：关闭或降采样 debug 图（`publish_debug_image: false` 或 `debug_image_every_n: 2`）
 - 用 rosbag 的压缩图输入：把 `image_topic` 改成 `/camera1/image_compressed` 且 `use_compressed: true`
 
+延迟统计开启后，节点每处理 `timing_log_interval` 帧汇总一次最近
+`timing_window_size` 帧的 p50、p95 和最大耗时。前
+`timing_warmup_frames` 帧只用于 TensorRT/CUDA 预热，不参加统计。主要字段：
+
+- `before_callback`：图像采集时间戳到 YOLO 回调开始；
+- `convert`：ROS 图像转换成连续 OpenCV 图像；
+- `model`：整个 Ultralytics `model()` 调用，包括其预处理、TensorRT 和后处理；
+- `extract`：检测框转换为 CPU NumPy 数据；
+- `total`：YOLO 回调开始到 `/yolo/cones` 发布；
+- `e2e`：图像采集时间戳到 `/yolo/cones` 发布。
+
+`before_callback` 和 `e2e` 显示 `n/a (clock mismatch)` 时，表示相机消息时间戳
+与节点时钟不在同一时间基准；此时 `convert/model/extract/total` 仍然有效。
+
 发布话题：
 - `/yolo/debug_image`
 - `/yolo/cones`
@@ -191,3 +205,42 @@ bash /home/juziwei/cone_ws/scripts/orin_validate.sh \
 
 日志默认输出到：
 `/home/juziwei/cone_ws/runs/orin_validation_YYYYMMDD_HHMMSS/`
+
+---
+
+## 8) TensorRT Engine 单独延迟测试
+
+`scripts/benchmark_engine.py` 只测试 TensorRT engine，不经过相机、ROS、
+Ultralytics 图像预处理或 NMS。请在实际运行检测节点的 Orin 上执行：
+
+```bash
+cd /home/juziwei/cone_ws
+
+python3 scripts/benchmark_engine.py \
+  --engine models/aggressive_0.engine \
+  --warmup 100 \
+  --iterations 1000 \
+  --output-dir runs/engine_benchmark/browser_off
+```
+
+打开浏览器后，用另一个输出目录再运行一次：
+
+```bash
+python3 scripts/benchmark_engine.py \
+  --engine models/aggressive_0.engine \
+  --warmup 100 \
+  --iterations 1000 \
+  --output-dir runs/engine_benchmark/browser_on
+```
+
+固定输入尺寸的 engine 会自动读取形状，不需要传 `--input-shape`。动态尺寸
+engine 可以使用 `--shape images=1x3x640x640` 指定本次测试尺寸。
+
+输出文件：
+
+- `benchmark.json`：环境、engine 哈希、测试参数以及 mean/p50/p90/p95/p99；
+- `latencies.csv`：每次推理的原始延迟，便于画图和比较长尾；
+- `engine_info.json`：当前 engine 可提供的 TensorRT 层信息。
+
+报告中的 `compute/gpu` 是输入输出已经位于 GPU 时的 engine 执行时间；
+`pipeline/gpu` 还包括输入和输出传输。它们都不等于 ROS 节点的端到端延迟。

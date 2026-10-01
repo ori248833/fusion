@@ -25,6 +25,11 @@
     debug_image_every_n: 1
     # 检测打印日志间隔帧数 (int)
     detect_log_interval: 0
-    # Enable briefly when measuring end-to-end latency.
+    # 统计相机时间戳到回调、图像转换、model()、GPU→CPU 提取和总延迟。
     enable_timing: true
-    timing_log_interval: 30
+    # 每处理 N 帧输出一次最近窗口的 p50/p95/max。
+    timing_log_interval: 100
+    # 最近多少个已处理帧参与统计。
+    timing_window_size: 100
+    # 前 N 个已处理帧只预热，不参与统计。
+    timing_warmup_frames: 10

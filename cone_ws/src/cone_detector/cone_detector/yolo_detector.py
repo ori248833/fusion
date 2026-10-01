@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from collections import deque
 from pathlib import Path
 import time
 import traceback
@@ -40,7 +41,9 @@ class YOLOConeDetector(Node):
         self.declare_parameter('debug_image_every_n', 1)
         self.declare_parameter('detect_log_interval', 0)
         self.declare_parameter('enable_timing', False)
-        self.declare_parameter('timing_log_interval', 30)
+        self.declare_parameter('timing_log_interval', 100)
+        self.declare_parameter('timing_window_size', 100)
+        self.declare_parameter('timing_warmup_frames', 10)
         self.declare_parameter('imgsz', 640)
 
         model_path = self._resolve_model_path(
@@ -63,6 +66,12 @@ class YOLOConeDetector(Node):
         self.timing_log_interval = max(
             1, int(self.get_parameter('timing_log_interval').value)
         )
+        self.timing_window_size = max(
+            1, int(self.get_parameter('timing_window_size').value)
+        )
+        self.timing_warmup_frames = max(
+            0, int(self.get_parameter('timing_warmup_frames').value)
+        )
         self.imgsz = int(self.get_parameter('imgsz').value)
 
         self.bridge = CvBridge()
@@ -74,6 +83,7 @@ class YOLOConeDetector(Node):
         self.frame_count = 0
         self.detect_log_count = 0
         self.last_process_wall_time = 0.0
+        self.timing_samples = deque(maxlen=self.timing_window_size)
 
         latest_only_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -117,6 +127,12 @@ class YOLOConeDetector(Node):
         }
         mode = 'debug' if self.enable_visualization else 'race/performance'
         self.get_logger().info(f'YOLO Cone Detector initialized ({mode} mode)')
+        if self.enable_timing:
+            self.get_logger().info(
+                'Timing enabled: reporting p50/p95/max over the latest '
+                f'{self.timing_window_size} processed frames after '
+                f'{self.timing_warmup_frames} warm-up frames'
+            )
 
     @staticmethod
     def _resolve_model_path(configured_path: str) -> Path:
@@ -158,6 +174,17 @@ class YOLOConeDetector(Node):
             if 'timing_log_interval' in updates:
                 self.timing_log_interval = max(
                     1, int(updates['timing_log_interval'])
+                )
+            if 'timing_window_size' in updates:
+                self.timing_window_size = max(
+                    1, int(updates['timing_window_size'])
+                )
+                self.timing_samples = deque(
+                    self.timing_samples, maxlen=self.timing_window_size
+                )
+            if 'timing_warmup_frames' in updates:
+                self.timing_warmup_frames = max(
+                    0, int(updates['timing_warmup_frames'])
                 )
             if 'detect_log_interval' in updates:
                 self.detect_log_interval = int(updates['detect_log_interval'])
@@ -296,40 +323,86 @@ class YOLOConeDetector(Node):
     def _stamp_to_seconds(header) -> float:
         return float(header.stamp.sec) + float(header.stamp.nanosec) * 1e-9
 
-    def _maybe_log_timing(self, header, marks):
-        if not self.enable_timing:
-            return
-        if self.frame_count % self.timing_log_interval != 0:
-            return
-        convert_ms = (marks['converted'] - marks['start']) * 1000.0
-        infer_ms = (marks['inferred'] - marks['converted']) * 1000.0
-        extract_ms = (marks['extracted'] - marks['inferred']) * 1000.0
-        build_publish_ms = (marks['published'] - marks['extracted']) * 1000.0
-        total_ms = (marks['published'] - marks['start']) * 1000.0
+    @staticmethod
+    def _valid_age_ms(current_seconds: float, source_seconds: float) -> float:
+        age_ms = (current_seconds - source_seconds) * 1000.0
+        # A negative or extremely large value means that the camera stamp and
+        # this node are not using the same clock. Keep the internal timings,
+        # but do not report a misleading source-to-node latency.
+        if 0.0 <= age_ms < 60_000.0:
+            return age_ms
+        return float('nan')
 
-        now_ros = self.get_clock().now().nanoseconds * 1e-9
-        source_stamp = self._stamp_to_seconds(header)
-        e2e_ms = (now_ros - source_stamp) * 1000.0
-        e2e_text = f' e2e={e2e_ms:.1f}ms' if 0.0 <= e2e_ms < 60_000.0 else ''
-        self.get_logger().info(
-            f'timing convert={convert_ms:.1f}ms infer={infer_ms:.1f}ms '
-            f'extract={extract_ms:.1f}ms build+publish={build_publish_ms:.1f}ms '
-            f'total={total_ms:.1f}ms{e2e_text}'
+    @staticmethod
+    def _format_timing_stat(samples, key: str) -> str:
+        values = np.asarray(
+            [sample[key] for sample in samples], dtype=np.float64
+        )
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return 'p50=n/a p95=n/a max=n/a (clock mismatch)'
+        return (
+            f'p50={np.percentile(values, 50):.1f} '
+            f'p95={np.percentile(values, 95):.1f} '
+            f'max={np.max(values):.1f}'
         )
 
-    def _process_image(self, image_msg, cv_image, start_time):
+    def _record_and_maybe_log_timing(self, header, marks):
+        if not self.enable_timing:
+            return
+        if self.frame_count <= self.timing_warmup_frames:
+            return
+
+        source_stamp = self._stamp_to_seconds(header)
+        sample = {
+            'before_callback': self._valid_age_ms(
+                marks['callback_ros'], source_stamp
+            ),
+            'convert': (marks['converted'] - marks['callback_start']) * 1000.0,
+            'model': (marks['model_end'] - marks['model_start']) * 1000.0,
+            'extract': (marks['extracted'] - marks['model_end']) * 1000.0,
+            'total': (marks['published'] - marks['callback_start']) * 1000.0,
+            'e2e': self._valid_age_ms(marks['published_ros'], source_stamp),
+        }
+        self.timing_samples.append(sample)
+
+        if self.frame_count % self.timing_log_interval != 0:
+            return
+
+        lines = [
+            f'YOLO timing over latest {len(self.timing_samples)} frames (ms):'
+        ]
+        labels = (
+            ('before_callback', 'source stamp -> callback'),
+            ('convert', 'ROS image -> OpenCV'),
+            ('model', 'Ultralytics model()'),
+            ('extract', 'boxes GPU -> CPU'),
+            ('total', 'callback -> cones publish'),
+            ('e2e', 'source stamp -> cones publish'),
+        )
+        for key, label in labels:
+            lines.append(
+                f'  {key:<15} {self._format_timing_stat(self.timing_samples, key)} '
+                f'[{label}]'
+            )
+        self.get_logger().info(
+            '\n'.join(lines)
+        )
+
+    def _process_image(self, image_msg, cv_image, callback_start, callback_ros):
         if not cv_image.flags['C_CONTIGUOUS']:
             cv_image = np.ascontiguousarray(cv_image)
         converted_time = time.perf_counter()
 
         self.frame_count += 1
+        model_start = time.perf_counter()
         results = self.model(
             cv_image,
             conf=self.conf_thresh,
             imgsz=self.imgsz,
             verbose=False,
         )
-        inferred_time = time.perf_counter()
+        model_end = time.perf_counter()
         extracted = self._extract_boxes(results)
         extracted_time = time.perf_counter()
 
@@ -337,40 +410,54 @@ class YOLOConeDetector(Node):
         self._maybe_log_detected(count)
         cone_array = self._build_cone_array(image_msg.header, extracted)
         self.cone_pub.publish(cone_array)
-
-        if self._wants_debug_image():
-            self._publish_debug_image(cv_image, extracted, image_msg.header)
         published_time = time.perf_counter()
-        self._maybe_log_timing(
+        published_ros = self.get_clock().now().nanoseconds * 1e-9
+
+        # Record /yolo/cones timing before optional debug-image work so that
+        # visualization cannot inflate the detector output latency.
+        self._record_and_maybe_log_timing(
             image_msg.header,
             {
-                'start': start_time,
+                'callback_start': callback_start,
+                'callback_ros': callback_ros,
                 'converted': converted_time,
-                'inferred': inferred_time,
+                'model_start': model_start,
+                'model_end': model_end,
                 'extracted': extracted_time,
                 'published': published_time,
+                'published_ros': published_ros,
             },
         )
 
+        if self._wants_debug_image():
+            self._publish_debug_image(cv_image, extracted, image_msg.header)
+
     def image_only_callback(self, image_msg: Image):
+        callback_start = time.perf_counter()
+        callback_ros = self.get_clock().now().nanoseconds * 1e-9
         if not self._should_process():
             return
-        start_time = time.perf_counter()
         try:
             cv_image = self.bridge.imgmsg_to_cv2(image_msg, 'bgr8')
-            self._process_image(image_msg, cv_image, start_time)
+            self._process_image(
+                image_msg, cv_image, callback_start, callback_ros
+            )
         except Exception as error:
             self.get_logger().error(
                 f'Error in image callback: {error}\n{traceback.format_exc()}'
             )
 
     def compressed_image_callback(self, image_msg: CompressedImage):
+        callback_start = time.perf_counter()
+        callback_ros = self.get_clock().now().nanoseconds * 1e-9
         if not self._should_process():
             return
-        start_time = time.perf_counter()
         try:
             self._process_image(
-                image_msg, self._decode_compressed(image_msg), start_time
+                image_msg,
+                self._decode_compressed(image_msg),
+                callback_start,
+                callback_ros,
             )
         except Exception as error:
             self.get_logger().error(
