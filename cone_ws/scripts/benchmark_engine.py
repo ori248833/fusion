@@ -45,12 +45,12 @@ else:
     TRT_IMPORT_ERROR = None
 
 try:
-    import pycuda.driver as cuda
+    import torch
 except ImportError as error:  # Keep --help usable away from the Orin.
-    cuda = None
-    CUDA_IMPORT_ERROR = error
+    torch = None
+    TORCH_IMPORT_ERROR = error
 else:
-    CUDA_IMPORT_ERROR = None
+    TORCH_IMPORT_ERROR = None
 
 
 @dataclass
@@ -59,13 +59,13 @@ class TensorBuffer:
     index: int
     is_input: bool
     shape: Tuple[int, ...]
-    numpy_dtype: np.dtype
-    host: np.ndarray
+    torch_dtype: object
+    host: object
     device: object
 
     @property
     def nbytes(self) -> int:
-        return int(self.host.nbytes)
+        return int(self.host.numel() * self.host.element_size())
 
 
 @dataclass
@@ -299,25 +299,62 @@ def resolve_input_shapes(
     return resolved
 
 
-def fill_input(host: np.ndarray, dtype: np.dtype, rng: np.random.Generator) -> None:
-    if np.issubdtype(dtype, np.floating):
-        host[:] = rng.random(host.size).astype(dtype, copy=False)
-    elif np.issubdtype(dtype, np.bool_):
-        host[:] = rng.integers(0, 2, size=host.size, dtype=np.int8).astype(dtype)
-    elif np.issubdtype(dtype, np.integer):
-        info = np.iinfo(dtype)
+def torch_dtype_for_trt(dtype):
+    """Map TensorRT data types without going through NumPy's binary API."""
+    candidates = [
+        ("float32", "float32"),
+        ("float16", "float16"),
+        ("int8", "int8"),
+        ("int32", "int32"),
+        ("bool", "bool"),
+        ("uint8", "uint8"),
+        ("int64", "int64"),
+        ("bfloat16", "bfloat16"),
+    ]
+    for trt_name, torch_name in candidates:
+        if hasattr(trt, trt_name) and dtype == getattr(trt, trt_name):
+            return getattr(torch, torch_name)
+
+    # TensorRT releases differ in which aliases are exported at module level.
+    enum_candidates = [
+        ("FLOAT", "float32"),
+        ("HALF", "float16"),
+        ("INT8", "int8"),
+        ("INT32", "int32"),
+        ("BOOL", "bool"),
+        ("UINT8", "uint8"),
+        ("INT64", "int64"),
+        ("BF16", "bfloat16"),
+    ]
+    data_type = getattr(trt, "DataType", None)
+    if data_type is not None:
+        for enum_name, torch_name in enum_candidates:
+            if hasattr(data_type, enum_name) and dtype == getattr(data_type, enum_name):
+                return getattr(torch, torch_name)
+    raise TypeError(f"Unsupported TensorRT tensor dtype: {dtype}")
+
+
+def fill_input(host, dtype, generator) -> None:
+    if dtype.is_floating_point:
+        host.uniform_(0.0, 1.0, generator=generator)
+    elif dtype == torch.bool:
+        temporary = torch.randint(
+            0, 2, host.shape, dtype=torch.uint8, generator=generator
+        )
+        host.copy_(temporary)
+    else:
+        info = torch.iinfo(dtype)
         low = max(info.min, -16)
         high = min(info.max, 16)
-        host[:] = rng.integers(low, high + 1, size=host.size).astype(dtype)
-    else:
-        host.fill(0)
+        host.random_(low, high + 1, generator=generator)
 
 
 def allocate_buffers(
     engine,
     context,
     records: Sequence[Tuple[str, int, bool]],
-    rng: np.random.Generator,
+    generator,
+    device,
 ) -> Tuple[List[TensorBuffer], List[int]]:
     buffers: List[TensorBuffer] = []
     bindings = [0] * (engine.num_bindings if not is_new_tensor_api(engine) else len(records))
@@ -333,43 +370,48 @@ def allocate_buffers(
         if volume <= 0:
             raise RuntimeError(f"Tensor {name!r} has invalid shape {shape}")
 
-        numpy_dtype = np.dtype(trt.nptype(engine_tensor_dtype(engine, name, index)))
-        host = cuda.pagelocked_empty(volume, numpy_dtype)
+        torch_dtype = torch_dtype_for_trt(engine_tensor_dtype(engine, name, index))
+        host = torch.empty(volume, dtype=torch_dtype, pin_memory=True)
         if is_input:
-            fill_input(host, numpy_dtype, rng)
+            fill_input(host, torch_dtype, generator)
         else:
-            host.fill(0)
-        device = cuda.mem_alloc(host.nbytes)
-        buffer = TensorBuffer(name, index, is_input, shape, numpy_dtype, host, device)
+            host.zero_()
+        device_tensor = torch.empty(volume, dtype=torch_dtype, device=device)
+        buffer = TensorBuffer(
+            name, index, is_input, shape, torch_dtype, host, device_tensor
+        )
         buffers.append(buffer)
 
         if is_new_tensor_api(engine):
-            context.set_tensor_address(name, int(device))
+            context.set_tensor_address(name, int(device_tensor.data_ptr()))
         else:
-            bindings[index] = int(device)
+            bindings[index] = int(device_tensor.data_ptr())
 
     return buffers, bindings
 
 
 def execute_async(context, engine, bindings: Sequence[int], stream) -> None:
+    stream_handle = int(stream.cuda_stream)
     if is_new_tensor_api(engine) and hasattr(context, "execute_async_v3"):
-        ok = context.execute_async_v3(stream_handle=stream.handle)
+        ok = context.execute_async_v3(stream_handle=stream_handle)
     else:
-        ok = context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+        ok = context.execute_async_v2(bindings=bindings, stream_handle=stream_handle)
     if ok is False:
         raise RuntimeError("TensorRT execute_async returned false")
 
 
 def copy_inputs_to_device(buffers: Sequence[TensorBuffer], stream) -> None:
-    for buffer in buffers:
-        if buffer.is_input:
-            cuda.memcpy_htod_async(buffer.device, buffer.host, stream)
+    with torch.cuda.stream(stream):
+        for buffer in buffers:
+            if buffer.is_input:
+                buffer.device.copy_(buffer.host, non_blocking=True)
 
 
 def copy_outputs_to_host(buffers: Sequence[TensorBuffer], stream) -> None:
-    for buffer in buffers:
-        if not buffer.is_input:
-            cuda.memcpy_dtoh_async(buffer.host, buffer.device, stream)
+    with torch.cuda.stream(stream):
+        for buffer in buffers:
+            if not buffer.is_input:
+                buffer.host.copy_(buffer.device, non_blocking=True)
 
 
 def warm_up(
@@ -397,8 +439,8 @@ def measure_phase(
     include_transfers: bool,
 ) -> List[Sample]:
     samples: List[Sample] = []
-    start_event = cuda.Event()
-    end_event = cuda.Event()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
     if not include_transfers:
         copy_inputs_to_device(buffers, stream)
@@ -424,7 +466,7 @@ def measure_phase(
             Sample(
                 phase=phase,
                 iteration=iteration,
-                gpu_ms=float(start_event.time_till(end_event)),
+                gpu_ms=float(start_event.elapsed_time(end_event)),
                 host_ms=(host_end - host_start) * 1e-6,
                 enqueue_ms=(enqueue_end - enqueue_start) * 1e-6,
             )
@@ -491,8 +533,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if trt is None:
         print(f"TensorRT Python module is unavailable: {TRT_IMPORT_ERROR}", file=sys.stderr)
         return 2
-    if cuda is None:
-        print(f"PyCUDA is unavailable: {CUDA_IMPORT_ERROR}", file=sys.stderr)
+    if torch is None:
+        print(f"PyTorch is unavailable: {TORCH_IMPORT_ERROR}", file=sys.stderr)
+        return 2
+    if not torch.cuda.is_available():
+        print("PyTorch cannot access CUDA on this system", file=sys.stderr)
         return 2
 
     engine_path = args.engine.expanduser().resolve()
@@ -514,10 +559,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(str(error), file=sys.stderr)
         return 2
 
-    cuda.init()
-    device = cuda.Device(args.device)
-    cuda_context = device.make_context()
-    allocations: List[object] = []
+    torch.cuda.set_device(args.device)
+    torch.cuda.init()
+    device = torch.device("cuda", args.device)
+    device_properties = torch.cuda.get_device_properties(args.device)
 
     try:
         logger = trt.Logger(trt.Logger.WARNING)
@@ -550,23 +595,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.input_shape,
             args.profile_index,
         )
-        rng = np.random.default_rng(args.seed)
-        buffers, bindings = allocate_buffers(engine, context, records, rng)
-        allocations.extend(buffer.device for buffer in buffers)
-        stream = cuda.Stream()
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(args.seed)
+        buffers, bindings = allocate_buffers(
+            engine, context, records, generator, device
+        )
+        stream = torch.cuda.Stream(device=device)
 
         print(f"Engine: {engine_path}")
         print(f"TensorRT: {trt.__version__}")
         print(
-            f"CUDA device: {device.name()} | compute capability "
-            f"{'.'.join(map(str, device.compute_capability()))}"
+            f"CUDA device: {device_properties.name} | compute capability "
+            f"{device_properties.major}.{device_properties.minor}"
         )
         print("Tensors:")
         for buffer in buffers:
             direction = "input " if buffer.is_input else "output"
             print(
                 f"  {direction} {buffer.name}: shape={buffer.shape} "
-                f"dtype={buffer.numpy_dtype} bytes={buffer.nbytes}"
+                f"dtype={buffer.torch_dtype} bytes={buffer.nbytes}"
             )
 
         inspector_error = export_engine_info(engine, output_dir / "engine_info.json")
@@ -618,11 +665,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "platform": platform.platform(),
                 "python": platform.python_version(),
                 "tensorrt": trt.__version__,
-                "cuda_driver_version": int(cuda.get_driver_version()),
+                "pytorch": torch.__version__,
+                "pytorch_cuda": torch.version.cuda,
                 "cuda_device_index": args.device,
-                "cuda_device_name": device.name(),
-                "compute_capability": list(device.compute_capability()),
-                "device_total_memory_bytes": int(device.total_memory()),
+                "cuda_device_name": device_properties.name,
+                "compute_capability": [
+                    device_properties.major,
+                    device_properties.minor,
+                ],
+                "device_total_memory_bytes": int(device_properties.total_memory),
             },
             "settings": {
                 "warmup": args.warmup,
@@ -636,7 +687,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "name": buffer.name,
                     "direction": "input" if buffer.is_input else "output",
                     "shape": list(buffer.shape),
-                    "dtype": str(buffer.numpy_dtype),
+                    "dtype": str(buffer.torch_dtype),
                     "bytes": buffer.nbytes,
                 }
                 for buffer in buffers
@@ -662,14 +713,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as error:
         print(f"Benchmark failed: {error}", file=sys.stderr)
         return 1
-    finally:
-        for allocation in reversed(allocations):
-            try:
-                allocation.free()
-            except Exception:
-                pass
-        cuda_context.pop()
-        cuda_context.detach()
 
 
 if __name__ == "__main__":

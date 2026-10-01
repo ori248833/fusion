@@ -211,7 +211,8 @@ bash /home/juziwei/cone_ws/scripts/orin_validate.sh \
 ## 8) TensorRT Engine 单独延迟测试
 
 `scripts/benchmark_engine.py` 只测试 TensorRT engine，不经过相机、ROS、
-Ultralytics 图像预处理或 NMS。请在实际运行检测节点的 Orin 上执行：
+Ultralytics 图像预处理或 NMS。脚本通过 PyTorch CUDA 张量向 TensorRT
+提供显存，不依赖 PyCUDA。请在实际运行检测节点的 Orin 上执行：
 
 ```bash
 cd /home/juziwei/cone_ws
