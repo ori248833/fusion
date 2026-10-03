@@ -2,7 +2,10 @@
   ros__parameters:
     lidar_frame: "hesai_lidar"
 
-    max_sync_diff: 0.05
+    max_sync_diff: 0.10
+    camera_pending_wait_sec: 0.30
+    camera_pending_max_frames: 12
+    fusion_queue_max_tasks: 12
     lidar_history_duration: 0.60
     enable_camera_age_gate: false
     max_camera_result_age: 0.50

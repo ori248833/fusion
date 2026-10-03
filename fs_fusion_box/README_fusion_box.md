@@ -257,7 +257,8 @@ LiDAR callback
 
 Map 发布不经过相机融合任务队列，因此相机投影、匹配、可视化或工作线程积压都不会阻塞 LiDAR 发布。
 
-旧代码中的雷达任务清队列逻辑已经移除。现在只有 Camera 补色任务允许 latest-only。
+旧代码中的雷达任务清队列逻辑已经移除。Camera 补色使用有界队列，
+积压达到上限时丢弃最旧任务。
 
 ### 7.2 内部 Track
 
@@ -353,6 +354,17 @@ best_lidar = argmin |camera_stamp - lidar_stamp|
 
 才进入空间匹配。
 
+如果 Camera 时间戳领先于最新已收到的 LiDAR，且暂时找不到合格帧，
+节点会把该 Camera 结果暂存最多 `camera_pending_wait_sec` 秒。后续 LiDAR
+到达时，节点先发布实时 Map，再将时间差合格的暂存结果按相机时间戳
+顺序送入有界融合队列。队列满时丢弃最旧任务并计入 `superseded`。
+等待使用单调墙钟，配对仍只使用原始 `header.stamp`。
+如果 Camera 时间戳已经落后于最新 LiDAR 且超出同步门限，继续等待
+更晚的 LiDAR 无法救回该帧，因此直接拒绝。缓存有容量上限和定时清理。
+项目的两套启动配置将 `max_sync_diff` 设为 `0.10 s`；节点自身的参数
+默认值仍为 `0.05 s`。低速或暂停的 bag 回放可能超过墙钟等待上限，
+此时需按回放速度调整 `camera_pending_wait_sec`。
+
 `max_sync_diff` 和 `max_camera_result_age` 含义不同：
 
 | 参数 | 限制内容 |
@@ -377,7 +389,9 @@ Camera ConeArray
   → 更新对应 Track 颜色
 ```
 
-Camera 任务队列只保留最新有效任务。工作线程来不及处理时，旧 Camera 补色任务可以被更新结果替代，但 LiDAR Map 发布不会丢帧。
+Camera 任务按入队顺序处理。工作线程来不及处理且达到
+`fusion_queue_max_tasks` 时，最旧任务会被丢弃并计入 `superseded`；
+LiDAR Map 发布不等待该线程。
 
 ### 7.7 颜色何时出现在 Map 中
 
@@ -694,6 +708,9 @@ fusion_effect_000001_lidar_1788684704_031418085_camera_1788684704_032001000.png
 | 参数 | 默认值 | 说明 | 修改后是否立即生效 |
 |---|---:|---|---|
 | `lidar_history_duration` | `0.60` s | 历史 LiDAR 保存时间 | 需重启 |
+| `camera_pending_wait_sec` | `0.30` s | 先到的 Camera 最长等待后续 LiDAR 的墙钟时间；设为 0 可关闭 | 需重启 |
+| `camera_pending_max_frames` | `12` | 待配对 Camera 的容量上限，满时丢弃最早帧 | 需重启 |
+| `fusion_queue_max_tasks` | `12` | 融合任务队列容量上限，满时丢弃最旧任务 | 需重启 |
 | `max_camera_result_age` | `0.50` s | Camera 结果允许晚到的硬上限 | 需重启 |
 | `camera_age_warn_threshold` | `0.40` s | Camera 高延迟统计阈值 | 需重启 |
 | `track_match_distance` | `1.50` | LiDAR 锥桶与 Track 的最大 x/y 距离 | 需重启 |
@@ -758,10 +775,11 @@ fusion_box_node:
 
 ```text
 Health | lidar rx/pub 10.0/10.0 Hz (500/500), camera 17.8 Hz
-accepted=420 expired=3 no_history=5
+accepted=420 processed=419 superseded=1 queue_expired=0 expired=3 no_history=5
 age p50/p95/max 82.1/191.4/403.2 ms
 sync_p95=34.1 ms fusion_p95=4.5 ms
 tracks=18 colored=86.2% updates=201 conflicts=2
+camera_pending=0 queued=10 recovered=8 timeout=2 overflow=0
 ```
 
 字段含义：
@@ -771,7 +789,10 @@ tracks=18 colored=86.2% updates=201 conflicts=2
 | `lidar rx/pub` | 当前周期 LiDAR 接收/发布频率 |
 | `(received/published)` | 启动以来 LiDAR 接收/发布总数 |
 | `camera Hz` | Camera 输入频率 |
-| `accepted` | 通过延迟和时间同步检查的 Camera 帧数 |
+| `accepted` | 通过延迟和时间同步检查并进入融合队列的 Camera 帧数 |
+| `processed/superseded/queue_expired` | 已完成融合、因队列满而被替换、排队后超过 Camera 年龄上限的任务数 |
+| `camera_pending` | 当前待配对 Camera 帧数 |
+| `queued/recovered/timeout/overflow` | 曾暂存、被后续 LiDAR 救回、等待超时、容量满时丢弃的帧数 |
 | `expired` | 超过 0.5 秒而丢弃的 Camera 帧数 |
 | `no_history` | 没有找到时间差合格历史 LiDAR 的 Camera 帧数 |
 | `age p50/p95/max` | Camera 结果年龄分布 |

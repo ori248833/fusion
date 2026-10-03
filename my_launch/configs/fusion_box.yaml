@@ -5,7 +5,14 @@
     lidar_frame: "hesai_lidar"
     # LiDAR 与 Camera 原始采集时间戳的最大差值，单位秒。
     # 它只判断是否属于同一观测时刻，不能用来容忍 YOLO 推理延迟。
-    max_sync_diff: 0.05
+    max_sync_diff: 0.10
+
+    # 相机结果先到而对应 LiDAR 检测尚未发布时，最多等待 0.30 秒。
+    # 等待使用单调墙钟；实际配对仍只比较两路原始采集时间戳。
+    camera_pending_wait_sec: 0.30
+    camera_pending_max_frames: 12
+    # 多帧相机在同一 LiDAR 到达后被释放时，融合线程按时间顺序处理。
+    fusion_queue_max_tasks: 12
 
     # ========== 相机晚到补色与内部 Track ==========
     # 保存历史 LiDAR 帧的时间长度，单位秒；Camera 晚到时在此缓存中找对应雷达帧。

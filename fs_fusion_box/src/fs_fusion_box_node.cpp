@@ -148,6 +148,8 @@ public:
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::duration<double>(health_interval)),
             std::bind(&FusionNode::log_health, this));
+        pending_timer_ = create_wall_timer(
+            50ms, std::bind(&FusionNode::expire_pending_cameras, this));
 
         RCLCPP_INFO(
             get_logger(),
@@ -169,6 +171,8 @@ private:
         uint8_t pending_color{drd25_msgs::msg::Cone::UNKNOWN};
         unsigned int pending_color_count{0};
         double last_color_stamp{0.0};
+        double last_camera_observation_stamp{
+            -std::numeric_limits<double>::infinity()};
     };
 
     struct LidarHistoryFrame {
@@ -182,6 +186,11 @@ private:
         CameraMsg::ConstSharedPtr camera_msg;
         double camera_age_sec{0.0};
         double sync_diff_sec{0.0};
+    };
+
+    struct PendingCameraFrame {
+        CameraMsg::ConstSharedPtr msg;
+        std::chrono::steady_clock::time_point queued_at;
     };
 
     struct VisualizationData {
@@ -253,6 +262,9 @@ private:
         declare_parameter("lidar_window_size", 10);
         declare_parameter("camera_window_size", 10);
         declare_parameter("max_sync_diff", 0.05);
+        declare_parameter("camera_pending_wait_sec", 0.30);
+        declare_parameter("camera_pending_max_frames", 12);
+        declare_parameter("fusion_queue_max_tasks", 12);
 
         // New internal scheduling/tracking parameters. They do not alter the
         // SLAM-facing message or topic contract.
@@ -298,6 +310,12 @@ private:
     void load_runtime_parameters() {
         overlap_threshold_ = get_parameter("overlap_threshold").as_double();
         max_sync_diff_ = get_parameter("max_sync_diff").as_double();
+        camera_pending_wait_sec_ = std::max(
+            0.0, get_parameter("camera_pending_wait_sec").as_double());
+        camera_pending_max_frames_ = static_cast<size_t>(std::max<int64_t>(
+            1, get_parameter("camera_pending_max_frames").as_int()));
+        fusion_queue_max_tasks_ = static_cast<size_t>(std::max<int64_t>(
+            1, get_parameter("fusion_queue_max_tasks").as_int()));
         lidar_history_duration_ =
             get_parameter("lidar_history_duration").as_double();
         enable_camera_age_gate_ =
@@ -396,6 +414,13 @@ private:
             return;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            camera_pending_shutdown_.fetch_add(
+                pending_cameras_.size(), std::memory_order_relaxed);
+            pending_cameras_.clear();
+        }
+
         fusion_cv_.notify_all();
         visualization_cv_.notify_all();
 
@@ -469,6 +494,63 @@ private:
             msg->cones.size(), std::memory_order_relaxed);
         colored_cones_published_.fetch_add(
             colored_count, std::memory_order_relaxed);
+
+        // Match waiting cameras only after the real-time Map publish.
+        std::vector<std::pair<PendingCameraFrame, double>> matched_pending;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            expire_pending_cameras_locked(std::chrono::steady_clock::now());
+            const double now_sec = enable_camera_age_gate_
+                ? static_cast<double>(get_clock()->now().nanoseconds()) * 1e-9
+                : 0.0;
+            for (size_t i = 0; i < pending_cameras_.size();) {
+                const double camera_stamp = stamp_to_sec(
+                    pending_cameras_[i].msg->header.stamp);
+                if (enable_camera_age_gate_ &&
+                    now_sec - camera_stamp > max_camera_result_age_) {
+                    camera_expired_.fetch_add(1, std::memory_order_relaxed);
+                    pending_cameras_.erase(pending_cameras_.begin() + i);
+                    continue;
+                }
+                ++i;
+            }
+            for (size_t i = 0; i < pending_cameras_.size();) {
+                const double camera_stamp = stamp_to_sec(
+                    pending_cameras_[i].msg->header.stamp);
+                const double diff = std::abs(lidar_stamp - camera_stamp);
+                if (diff <= max_sync_diff_) {
+                    matched_pending.emplace_back(
+                        std::move(pending_cameras_[i]), diff);
+                    pending_cameras_.erase(pending_cameras_.begin() + i);
+                    continue;
+                }
+                ++i;
+            }
+        }
+        std::stable_sort(
+            matched_pending.begin(), matched_pending.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return stamp_to_sec(lhs.first.msg->header.stamp) <
+                       stamp_to_sec(rhs.first.msg->header.stamp);
+            });
+        for (const auto& pending : matched_pending) {
+            const double camera_stamp = stamp_to_sec(
+                pending.first.msg->header.stamp);
+            const double camera_age = enable_camera_age_gate_
+                ? static_cast<double>(get_clock()->now().nanoseconds()) * 1e-9 -
+                      camera_stamp
+                : 0.0;
+            if (enable_camera_age_gate_ &&
+                camera_age > max_camera_result_age_) {
+                camera_expired_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                camera_pending_recovered_.fetch_add(
+                    1, std::memory_order_relaxed);
+                enqueue_fusion_task(
+                    LidarHistoryFrame{lidar_stamp, msg, track_ids},
+                    pending.first.msg, camera_age, pending.second);
+            }
+        }
     }
 
     void camera_callback(const CameraMsg::ConstSharedPtr& msg) {
@@ -491,8 +573,10 @@ private:
 
         std::optional<LidarHistoryFrame> best_lidar;
         double min_diff = std::numeric_limits<double>::max();
+        bool camera_deferred = false;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
+            expire_pending_cameras_locked(std::chrono::steady_clock::now());
             for (const auto& frame : lidar_history_) {
                 const double diff = std::abs(frame.stamp - camera_stamp);
                 if (diff < min_diff) {
@@ -500,6 +584,27 @@ private:
                     best_lidar = frame;
                 }
             }
+            if ((!best_lidar || min_diff > max_sync_diff_) &&
+                camera_pending_wait_sec_ > 0.0 &&
+                (lidar_history_.empty() ||
+                 camera_stamp > lidar_history_.back().stamp)) {
+                if (pending_cameras_.size() >= camera_pending_max_frames_) {
+                    pending_cameras_.pop_front();
+                    camera_pending_overflow_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    camera_without_lidar_history_.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                pending_cameras_.push_back(PendingCameraFrame{
+                    msg, std::chrono::steady_clock::now()});
+                camera_pending_queued_.fetch_add(
+                    1, std::memory_order_relaxed);
+                camera_deferred = true;
+            }
+        }
+
+        if (camera_deferred) {
+            return;
         }
 
         if (!best_lidar || min_diff > max_sync_diff_) {
@@ -507,19 +612,45 @@ private:
             return;
         }
 
+        enqueue_fusion_task(std::move(*best_lidar), msg, camera_age, min_diff);
+    }
+
+    void expire_pending_cameras_locked(
+        std::chrono::steady_clock::time_point now) {
+        while (!pending_cameras_.empty() &&
+               std::chrono::duration<double>(
+                   now - pending_cameras_.front().queued_at).count() >=
+                   camera_pending_wait_sec_) {
+            pending_cameras_.pop_front();
+            camera_pending_timeout_.fetch_add(1, std::memory_order_relaxed);
+            camera_without_lidar_history_.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+
+    void expire_pending_cameras() {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        expire_pending_cameras_locked(std::chrono::steady_clock::now());
+    }
+
+    void enqueue_fusion_task(
+        LidarHistoryFrame lidar_frame,
+        CameraMsg::ConstSharedPtr camera_msg,
+        double camera_age,
+        double sync_diff) {
         if (enable_camera_age_gate_) {
             record_timing_sample(camera_age_samples_ms_, camera_age * 1000.0);
         }
-        record_timing_sample(sync_diff_samples_ms_, min_diff * 1000.0);
+        record_timing_sample(sync_diff_samples_ms_, sync_diff * 1000.0);
 
         FusionTask task{
-            std::move(*best_lidar), msg, camera_age, min_diff};
+            std::move(lidar_frame), std::move(camera_msg), camera_age, sync_diff};
         {
             std::lock_guard<std::mutex> lock(fusion_mutex_);
-            if (!fusion_queue_.empty()) {
+            if (fusion_queue_.size() >= fusion_queue_max_tasks_) {
+                fusion_queue_.pop_front();
                 camera_tasks_superseded_.fetch_add(
-                    fusion_queue_.size(), std::memory_order_relaxed);
-                fusion_queue_.clear();
+                    1, std::memory_order_relaxed);
             }
             fusion_queue_.push_back(std::move(task));
             atomic_update_max(max_fusion_queue_depth_, fusion_queue_.size());
@@ -773,7 +904,7 @@ private:
     }
 
     void fusion_loop() {
-        while (running_.load(std::memory_order_relaxed)) {
+        while (true) {
             FusionTask task;
             {
                 std::unique_lock<std::mutex> lock(fusion_mutex_);
@@ -781,11 +912,23 @@ private:
                     return !fusion_queue_.empty() ||
                            !running_.load(std::memory_order_relaxed);
                 });
-                if (!running_.load(std::memory_order_relaxed)) {
+                if (fusion_queue_.empty() &&
+                    !running_.load(std::memory_order_relaxed)) {
                     break;
                 }
-                task = std::move(fusion_queue_.back());
-                fusion_queue_.clear();
+                task = std::move(fusion_queue_.front());
+                fusion_queue_.pop_front();
+            }
+
+            if (enable_camera_age_gate_) {
+                const double now_sec =
+                    static_cast<double>(get_clock()->now().nanoseconds()) * 1e-9;
+                if (now_sec - stamp_to_sec(task.camera_msg->header.stamp) >
+                    max_camera_result_age_) {
+                    camera_tasks_expired_in_queue_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    continue;
+                }
             }
 
             const auto processing_start = std::chrono::steady_clock::now();
@@ -863,6 +1006,21 @@ private:
                 continue;
             }
             Track& track = track_it->second;
+
+            // A camera frame can wait for LiDAR while a newer camera result
+            // updates the same track. Never let that older result roll back
+            // the color state.
+            if (is_confirmed_map_color(new_color)) {
+                if (camera_stamp <= track.last_camera_observation_stamp) {
+                    snapshot.colors[i] = is_confirmed_map_color(track.color)
+                        ? track.color
+                        : unknown_color_from_lidar_label(
+                              frame.msg->cones[i].label);
+                    snapshot.decisions[i] = "旧相机帧，保持较新颜色";
+                    continue;
+                }
+                track.last_camera_observation_stamp = camera_stamp;
+            }
 
             // UNKNOWN_SMALL and UNKNOWN_BIG carry LiDAR size only.  They must
             // not overwrite the color memory, but should be emitted when no
@@ -1569,23 +1727,31 @@ private:
         const TimingSnapshot timing = timing_snapshot();
 
         size_t track_count = 0;
+        size_t pending_count = 0;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             track_count = tracks_.size();
+            pending_count = pending_cameras_.size();
         }
 
         RCLCPP_INFO(
             get_logger(),
             "Health | lidar rx/pub %.1f/%.1f Hz (%zu/%zu), camera %.1f Hz "
-            "accepted=%zu expired=%zu no_history=%zu | age p50/p95/max "
+            "accepted=%zu processed=%zu superseded=%zu queue_expired=%zu "
+            "expired=%zu no_history=%zu | age p50/p95/max "
             "%.1f/%.1f/%.1f ms sync_p95=%.1f ms fusion_p95=%.1f ms | "
-            "tracks=%zu colored=%.1f%% updates=%zu conflicts=%zu",
+            "tracks=%zu colored=%.1f%% updates=%zu conflicts=%zu | "
+            "camera_pending=%zu queued=%zu recovered=%zu timeout=%zu "
+            "overflow=%zu",
             lidar_receive_hz,
             lidar_publish_hz,
             lidar_received,
             lidar_published,
             camera_receive_hz,
             camera_accepted_.load(),
+            fusion_processed_.load(),
+            camera_tasks_superseded_.load(),
+            camera_tasks_expired_in_queue_.load(),
             camera_expired_.load(),
             camera_without_lidar_history_.load(),
             timing.age_p50,
@@ -1596,7 +1762,12 @@ private:
             track_count,
             color_ratio,
             color_updates_.load(),
-            color_conflicts_.load());
+            color_conflicts_.load(),
+            pending_count,
+            camera_pending_queued_.load(),
+            camera_pending_recovered_.load(),
+            camera_pending_timeout_.load(),
+            camera_pending_overflow_.load());
 
         if (lidar_received != lidar_published) {
             RCLCPP_WARN(
@@ -1637,10 +1808,21 @@ private:
                   << " / " << camera_accepted_.load() << "\n"
                   << "Camera expired/no history:  " << camera_expired_.load()
                   << " / " << camera_without_lidar_history_.load() << "\n"
+                  << "Camera pending queued/recovered: "
+                  << camera_pending_queued_.load() << " / "
+                  << camera_pending_recovered_.load() << "\n"
+                  << "Camera pending timeout/overflow/shutdown: "
+                  << camera_pending_timeout_.load() << " / "
+                  << camera_pending_overflow_.load() << " / "
+                  << camera_pending_shutdown_.load() << "\n"
                   << "Camera high latency:        "
                   << camera_high_latency_.load() << "\n"
                   << "Camera tasks superseded:    "
                   << camera_tasks_superseded_.load() << "\n"
+                  << "Camera tasks expired in queue: "
+                  << camera_tasks_expired_in_queue_.load() << "\n"
+                  << "Fusion tasks processed:     "
+                  << fusion_processed_.load() << "\n"
                   << "Camera age p50/p95/max:      " << timing.age_p50 << " / "
                   << timing.age_p95 << " / " << timing.age_max << " ms\n"
                   << "Sync difference p95:        " << timing.sync_p95 << " ms\n"
@@ -1672,6 +1854,9 @@ private:
     CalibrationParams params_;
     double overlap_threshold_{0.60};
     double max_sync_diff_{0.05};
+    double camera_pending_wait_sec_{0.30};
+    size_t camera_pending_max_frames_{12};
+    size_t fusion_queue_max_tasks_{12};
     double lidar_history_duration_{0.60};
     bool enable_camera_age_gate_{true};
     double max_camera_result_age_{0.50};
@@ -1685,12 +1870,14 @@ private:
     rclcpp::Subscription<CameraMsg>::SharedPtr camera_sub_;
     rclcpp::Subscription<CloudMsg>::SharedPtr showcase_cloud_sub_;
     rclcpp::TimerBase::SharedPtr health_timer_;
+    rclcpp::TimerBase::SharedPtr pending_timer_;
     OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
     std::shared_ptr<Visualizer> visualizer_;
 
     std::mutex state_mutex_;
     std::unordered_map<uint64_t, Track> tracks_;
     std::deque<LidarHistoryFrame> lidar_history_;
+    std::deque<PendingCameraFrame> pending_cameras_;
     uint64_t next_track_id_{1};
 
     std::atomic<bool> running_{true};
@@ -1740,7 +1927,13 @@ private:
     std::atomic<size_t> camera_expired_{0};
     std::atomic<size_t> camera_high_latency_{0};
     std::atomic<size_t> camera_without_lidar_history_{0};
+    std::atomic<size_t> camera_pending_queued_{0};
+    std::atomic<size_t> camera_pending_recovered_{0};
+    std::atomic<size_t> camera_pending_timeout_{0};
+    std::atomic<size_t> camera_pending_overflow_{0};
+    std::atomic<size_t> camera_pending_shutdown_{0};
     std::atomic<size_t> camera_tasks_superseded_{0};
+    std::atomic<size_t> camera_tasks_expired_in_queue_{0};
     std::atomic<size_t> camera_unknown_colors_{0};
     std::atomic<size_t> fusion_processed_{0};
     std::atomic<size_t> camera_detections_{0};
