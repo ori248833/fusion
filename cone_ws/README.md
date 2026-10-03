@@ -128,11 +128,12 @@ source /opt/ros/humble/setup.bash
 source /home/ori/cone_ws/install/setup.bash
 
 ros2 run cone_detector yolo_detector --ros-args \
-  --params-file /home/ori/cone_ws/configs/yolo_detector.yaml
+  -r __node:=yolo_detector \
+  --params-file ../my_launch/configs/yolo_detector.yaml
 ```
 
 频率/性能常用参数：
-- 参数都在 `configs/yolo_detector.yaml`，改完重启节点即可
+- 参数统一放在 `../my_launch/configs/yolo_detector.yaml`，改完重新构建并重启节点
 - 图像回调只更新一个最新帧槽位，独立工作线程负责推理；工作线程忙时，
   新输入会覆盖尚未处理的旧输入，不会形成无界图像队列
 - `max_fps` 控制工作线程的最大推理启动频率；等待期间仍持续更新最新帧
@@ -253,3 +254,34 @@ engine 可以使用 `--shape images=1x3x640x640` 指定本次测试尺寸。
 
 报告中的 `compute/gpu` 是输入输出已经位于 GPU 时的 engine 执行时间；
 `pipeline/gpu` 还包括输入和输出传输。它们都不等于 ROS 节点的端到端延迟。
+
+---
+
+## 9) 模型分辨率、速度与效果对比
+
+所有脚本的完整用途、参数和示例见 `scripts/README.md`。
+
+`scripts/evaluate_models.py` 使用同一段 ROS 2 bag 测量一个或多个模型在不同
+`imgsz` 下的模型墙钟耗时、Ultralytics 分段耗时、检测数量、置信度、类别分布和
+小框检测比例。如果提供带标签的数据集 YAML，还会运行 Ultralytics validation，
+汇总 Precision、Recall、mAP50、mAP50-95、每类别指标和匹配框颜色准确率。
+
+bag 没有人工真值时，检测数量、置信度和小框比例只能用于观察模型行为，不能当作
+准确率或远处锥桶召回率。真实效果对比需要在脚本配置区设置`DATASET_YAML`，指向
+带标签的验证集YAML。
+
+先修正 `configs/cone_bag_2026.yaml` 中的 `path`，再在 Orin 上执行：
+
+```bash
+cd /home/dian/fusion拉取/fusion/cone_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+python3 scripts/evaluate_models.py
+```
+
+运行前在`scripts/evaluate_models.py`顶部配置`MODEL_CANDIDATES`、`ROS_BAG_PATH`、
+`IMAGE_TOPIC`、`DATASET_YAML`和`OUTPUT_JSON`。完整配置示例见`scripts/README.md`。
+
+固定输入尺寸的 TensorRT engine 只能使用构建时的 `imgsz`。输出 JSON 中第一项
+成功的候选是 baseline；`comparison.deltas` 给出其他候选相对 baseline 的模型
+p50 延迟变化百分比、Recall 和 mAP50-95 变化百分点。

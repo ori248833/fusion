@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORKSPACE="/home/juziwei/cone_ws"
-PARAMS_FILE="$WORKSPACE/configs/yolo_detector.yaml"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+PARAMS_FILE=""
 BAG_PATH=""
 IMAGE_TOPIC=""
 BAG_RATE="1.0"
@@ -19,8 +20,8 @@ Required:
   --bag <path>               rosbag path
 
 Options:
-  --workspace <path>         ROS workspace (default: /home/juziwei/cone_ws)
-  --params-file <path>       detector param file (default: <workspace>/configs/yolo_detector.yaml)
+  --workspace <path>         ROS workspace (default: parent of this script directory)
+  --params-file <path>       detector params (default: ../my_launch/configs/yolo_detector.yaml)
   --image-topic <topic>      bag play topic (default: read from params file)
   --bag-rate <float>         rosbag play rate (default: 1.0)
   --duration <sec>           topic hz sample seconds (default: 20)
@@ -82,6 +83,16 @@ if [[ -z "$BAG_PATH" ]]; then
   exit 1
 fi
 
+if [[ -z "$PARAMS_FILE" ]]; then
+  MAIN_PARAMS_FILE="$WORKSPACE/../my_launch/configs/yolo_detector.yaml"
+  LEGACY_PARAMS_FILE="$WORKSPACE/configs/yolo_detector.yaml"
+  if [[ -f "$MAIN_PARAMS_FILE" ]]; then
+    PARAMS_FILE="$MAIN_PARAMS_FILE"
+  else
+    PARAMS_FILE="$LEGACY_PARAMS_FILE"
+  fi
+fi
+
 if [[ ! -d "$WORKSPACE" ]]; then
   echo "Workspace not found: $WORKSPACE" >&2
   exit 1
@@ -97,14 +108,32 @@ if [[ ! -d "$BAG_PATH" ]]; then
   exit 1
 fi
 
-MODEL_PATH="$(awk '/model_path:/{print $2; exit}' "$PARAMS_FILE")"
+read_yaml_scalar() {
+  local key="$1"
+  local file="$2"
+  awk -v key="$key" '
+    $1 == key ":" {
+      sub(/^[^:]*:[[:space:]]*/, "")
+      sub(/[[:space:]]*#.*/, "")
+      gsub(/^[[:space:]\"]+/, "")
+      gsub(/[[:space:]\"]+$/, "")
+      print
+      exit
+    }
+  ' "$file"
+}
+
+MODEL_PATH="$(read_yaml_scalar model_path "$PARAMS_FILE")"
+if [[ "$MODEL_PATH" != /* ]]; then
+  MODEL_PATH="$WORKSPACE/$MODEL_PATH"
+fi
 if [[ -z "$MODEL_PATH" || ! -f "$MODEL_PATH" ]]; then
   echo "Model not found (from params): $MODEL_PATH" >&2
   exit 1
 fi
 
 if [[ -z "$IMAGE_TOPIC" ]]; then
-  IMAGE_TOPIC="$(awk '/image_topic:/{print $2; exit}' "$PARAMS_FILE")"
+  IMAGE_TOPIC="$(read_yaml_scalar image_topic "$PARAMS_FILE")"
 fi
 if [[ -z "$IMAGE_TOPIC" ]]; then
   echo "Failed to resolve image_topic from params. Use --image-topic explicitly." >&2
@@ -136,7 +165,9 @@ source /opt/ros/humble/setup.bash
 source "$WORKSPACE/install/setup.bash"
 
 echo "[1/5] Start detector node..."
-ros2 run cone_detector yolo_detector --ros-args --params-file "$PARAMS_FILE" \
+ros2 run cone_detector yolo_detector --ros-args \
+  -r __node:=yolo_detector --params-file "$PARAMS_FILE" \
+  -p use_sim_time:=true \
   > "$LOG_DIR/detector.log" 2>&1 &
 DETECTOR_PID=$!
 
