@@ -354,15 +354,20 @@ class YOLOConeDetector(Node):
             return
 
         source_stamp = self._stamp_to_seconds(header)
+        before_callback = self._valid_age_ms(
+            marks['callback_ros'], source_stamp
+        )
+        total = (marks['published'] - marks['callback_start']) * 1000.0
         sample = {
-            'before_callback': self._valid_age_ms(
-                marks['callback_ros'], source_stamp
-            ),
+            'before_callback': before_callback,
             'convert': (marks['converted'] - marks['callback_start']) * 1000.0,
             'model': (marks['model_end'] - marks['model_start']) * 1000.0,
             'extract': (marks['extracted'] - marks['model_end']) * 1000.0,
-            'total': (marks['published'] - marks['callback_start']) * 1000.0,
-            'e2e': self._valid_age_ms(marks['published_ros'], source_stamp),
+            'total': total,
+            # During rosbag playback, /clock may not advance while this
+            # single-threaded callback is running. Combine source-to-callback
+            # ROS time with monotonic callback time so inference is not lost.
+            'e2e': before_callback + total,
         }
         self.timing_samples.append(sample)
 
@@ -411,7 +416,6 @@ class YOLOConeDetector(Node):
         cone_array = self._build_cone_array(image_msg.header, extracted)
         self.cone_pub.publish(cone_array)
         published_time = time.perf_counter()
-        published_ros = self.get_clock().now().nanoseconds * 1e-9
 
         # Record /yolo/cones timing before optional debug-image work so that
         # visualization cannot inflate the detector output latency.
@@ -425,7 +429,6 @@ class YOLOConeDetector(Node):
                 'model_end': model_end,
                 'extracted': extracted_time,
                 'published': published_time,
-                'published_ros': published_ros,
             },
         )
 
