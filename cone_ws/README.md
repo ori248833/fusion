@@ -133,6 +133,9 @@ ros2 run cone_detector yolo_detector --ros-args \
 
 频率/性能常用参数：
 - 参数都在 `configs/yolo_detector.yaml`，改完重启节点即可
+- 图像回调只更新一个最新帧槽位，独立工作线程负责推理；工作线程忙时，
+  新输入会覆盖尚未处理的旧输入，不会形成无界图像队列
+- `max_fps` 控制工作线程的最大推理启动频率；等待期间仍持续更新最新帧
 - 想跑满输入（例如 30Hz）测试：把 `max_fps` 调大（如 `30.0`）
 - 只要锥桶结果更快：关闭或降采样 debug 图（`publish_debug_image: false` 或 `debug_image_every_n: 2`）
 - 用 rosbag 的压缩图输入：把 `image_topic` 改成 `/camera1/image_compressed` 且 `use_compressed: true`
@@ -141,11 +144,16 @@ ros2 run cone_detector yolo_detector --ros-args \
 `timing_window_size` 帧的 p50、p95 和最大耗时。前
 `timing_warmup_frames` 帧只用于 TensorRT/CUDA 预热，不参加统计。主要字段：
 
-- `before_callback`：图像采集时间戳到 YOLO 回调开始；
-- `convert`：ROS 图像转换成连续 OpenCV 图像；
-- `model`：整个 Ultralytics `model()` 调用，包括其预处理、TensorRT 和后处理；
+- `frames`：累计接收、处理、被新帧覆盖、待处理以及工作线程错误数量；
+- `before_callback`：图像采集时间戳到轻量订阅回调开始；
+- `worker_wait`：订阅回调到工作线程开始处理，包含限频等待；
+- `convert`：工作线程将 ROS 图像转换成连续 OpenCV 图像；
+- `preprocess/inference/postprocess`：Ultralytics 报告的模型内部分段；
+- `model_other`：`model()` 墙钟耗时中未被上述三项覆盖的部分；
+- `model`：整个 Ultralytics `model()` 墙钟耗时；
 - `extract`：检测框转换为 CPU NumPy 数据；
-- `total`：YOLO 回调开始到 `/yolo/cones` 发布；
+- `processing`：工作线程开始到 `/yolo/cones` 发布；
+- `total`：订阅回调开始到 `/yolo/cones` 发布，包含 `worker_wait`；
 - `e2e`：图像采集时间戳到 `/yolo/cones` 发布。
 
 `before_callback` 和 `e2e` 显示 `n/a (clock mismatch)` 时，表示相机消息时间戳

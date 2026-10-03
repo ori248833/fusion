@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
+import threading
 import time
 import traceback
 
@@ -20,6 +22,15 @@ from sensor_msgs.msg import CompressedImage, Image
 from ultralytics import YOLO
 
 from cone_interfaces.msg import Cone, ConeArray
+
+
+@dataclass(frozen=True)
+class PendingFrame:
+    """One latest-frame slot entry handed from ROS to the inference worker."""
+
+    message: object
+    callback_start: float
+    callback_ros: float
 
 
 class YOLOConeDetector(Node):
@@ -82,8 +93,20 @@ class YOLOConeDetector(Node):
 
         self.frame_count = 0
         self.detect_log_count = 0
-        self.last_process_wall_time = 0.0
         self.timing_samples = deque(maxlen=self.timing_window_size)
+        self._timing_lock = threading.Lock()
+
+        # The ROS subscription callback only replaces this one-slot buffer.
+        # TensorRT runs in a separate worker so the executor remains responsive
+        # to new images, /clock, parameter updates, and shutdown.
+        self._latest_condition = threading.Condition()
+        self._latest_frame = None
+        self._stop_worker_event = threading.Event()
+        self._last_inference_start = 0.0
+        self._input_frame_count = 0
+        self._overwritten_frame_count = 0
+        self._worker_error_count = 0
+        self._worker_thread = None
 
         latest_only_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -133,6 +156,16 @@ class YOLOConeDetector(Node):
                 f'{self.timing_window_size} processed frames after '
                 f'{self.timing_warmup_frames} warm-up frames'
             )
+        self._worker_thread = threading.Thread(
+            target=self._inference_worker,
+            name='yolo-inference-worker',
+            daemon=True,
+        )
+        self._worker_thread.start()
+        self.get_logger().info(
+            'Latest-frame worker started: subscription callbacks only replace '
+            'one pending frame; inference runs outside the ROS executor'
+        )
 
     @staticmethod
     def _resolve_model_path(configured_path: str) -> Path:
@@ -179,9 +212,10 @@ class YOLOConeDetector(Node):
                 self.timing_window_size = max(
                     1, int(updates['timing_window_size'])
                 )
-                self.timing_samples = deque(
-                    self.timing_samples, maxlen=self.timing_window_size
-                )
+                with self._timing_lock:
+                    self.timing_samples = deque(
+                        self.timing_samples, maxlen=self.timing_window_size
+                    )
             if 'timing_warmup_frames' in updates:
                 self.timing_warmup_frames = max(
                     0, int(updates['timing_warmup_frames'])
@@ -190,18 +224,86 @@ class YOLOConeDetector(Node):
                 self.detect_log_interval = int(updates['detect_log_interval'])
             if 'max_fps' in updates:
                 self.max_fps = float(updates['max_fps'])
+                with self._latest_condition:
+                    self._latest_condition.notify_all()
             return SetParametersResult(successful=True)
         except (TypeError, ValueError) as error:
             return SetParametersResult(successful=False, reason=str(error))
 
-    def _should_process(self) -> bool:
-        if self.max_fps <= 0:
-            return True
-        now = time.monotonic()
-        if now - self.last_process_wall_time < 1.0 / self.max_fps:
-            return False
-        self.last_process_wall_time = now
-        return True
+    def _enqueue_latest_frame(self, image_msg) -> None:
+        pending = PendingFrame(
+            message=image_msg,
+            callback_start=time.perf_counter(),
+            callback_ros=self.get_clock().now().nanoseconds * 1e-9,
+        )
+        with self._latest_condition:
+            if self._stop_worker_event.is_set():
+                return
+            self._input_frame_count += 1
+            if self._latest_frame is not None:
+                self._overwritten_frame_count += 1
+            self._latest_frame = pending
+            self._latest_condition.notify()
+
+    def _take_latest_frame_when_due(self):
+        """Wait for a frame and apply max_fps while retaining only the newest."""
+        with self._latest_condition:
+            while not self._stop_worker_event.is_set():
+                if self._latest_frame is None:
+                    self._latest_condition.wait()
+                    continue
+
+                max_fps = self.max_fps
+                if max_fps > 0.0 and self._last_inference_start > 0.0:
+                    due_time = self._last_inference_start + 1.0 / max_fps
+                    remaining = due_time - time.perf_counter()
+                    if remaining > 0.0:
+                        # wait() releases the lock. New arrivals can replace
+                        # the pending frame while the rate limiter is waiting.
+                        self._latest_condition.wait(timeout=remaining)
+                        continue
+
+                pending = self._latest_frame
+                self._latest_frame = None
+                return pending
+        return None
+
+    def _inference_worker(self) -> None:
+        while not self._stop_worker_event.is_set():
+            pending = self._take_latest_frame_when_due()
+            if pending is None:
+                break
+
+            worker_start = time.perf_counter()
+            self._last_inference_start = worker_start
+            try:
+                self._process_image(pending, worker_start)
+            except Exception as error:
+                self._worker_error_count += 1
+                self.get_logger().error(
+                    f'Error in YOLO inference worker: {error}\n'
+                    f'{traceback.format_exc()}'
+                )
+
+    def _stop_inference_worker(self) -> None:
+        worker = self._worker_thread
+        if worker is None:
+            return
+        self._stop_worker_event.set()
+        with self._latest_condition:
+            self._latest_frame = None
+            self._latest_condition.notify_all()
+        if worker is not threading.current_thread():
+            worker.join(timeout=5.0)
+        if worker.is_alive():
+            self.get_logger().warning(
+                'YOLO inference worker did not stop within 5 seconds'
+            )
+        self._worker_thread = None
+
+    def destroy_node(self):
+        self._stop_inference_worker()
+        return super().destroy_node()
 
     def _wants_debug_image(self) -> bool:
         return (
@@ -334,6 +436,36 @@ class YOLOConeDetector(Node):
         return float('nan')
 
     @staticmethod
+    def _model_speed_ms(results, model_wall_ms: float):
+        values = {
+            'preprocess': float('nan'),
+            'inference': float('nan'),
+            'postprocess': float('nan'),
+            'model_other': float('nan'),
+        }
+        if not results or results[0] is None:
+            return values
+        speed = getattr(results[0], 'speed', None)
+        if not isinstance(speed, dict):
+            return values
+
+        for key in ('preprocess', 'inference', 'postprocess'):
+            raw_value = speed.get(key)
+            if raw_value is None:
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                values[key] = value
+
+        parts = [values[key] for key in ('preprocess', 'inference', 'postprocess')]
+        if all(np.isfinite(value) for value in parts):
+            values['model_other'] = max(0.0, model_wall_ms - sum(parts))
+        return values
+
+    @staticmethod
     def _format_timing_stat(samples, key: str) -> str:
         values = np.asarray(
             [sample[key] for sample in samples], dtype=np.float64
@@ -358,43 +490,75 @@ class YOLOConeDetector(Node):
             marks['callback_ros'], source_stamp
         )
         total = (marks['published'] - marks['callback_start']) * 1000.0
+        processing = (marks['published'] - marks['worker_start']) * 1000.0
         sample = {
             'before_callback': before_callback,
-            'convert': (marks['converted'] - marks['callback_start']) * 1000.0,
+            'worker_wait': (
+                marks['worker_start'] - marks['callback_start']
+            ) * 1000.0,
+            'convert': (
+                marks['converted'] - marks['worker_start']
+            ) * 1000.0,
+            'preprocess': marks['model_speed']['preprocess'],
+            'inference': marks['model_speed']['inference'],
+            'postprocess': marks['model_speed']['postprocess'],
+            'model_other': marks['model_speed']['model_other'],
             'model': (marks['model_end'] - marks['model_start']) * 1000.0,
             'extract': (marks['extracted'] - marks['model_end']) * 1000.0,
+            'processing': processing,
             'total': total,
-            # During rosbag playback, /clock may not advance while this
-            # single-threaded callback is running. Combine source-to-callback
-            # ROS time with monotonic callback time so inference is not lost.
+            # Combine source-to-callback ROS time with monotonic in-node time.
+            # This remains valid when rosbag /clock does not advance during
+            # worker inference.
             'e2e': before_callback + total,
         }
-        self.timing_samples.append(sample)
+        with self._timing_lock:
+            self.timing_samples.append(sample)
+            if self.frame_count % self.timing_log_interval != 0:
+                return
+            samples = list(self.timing_samples)
 
-        if self.frame_count % self.timing_log_interval != 0:
-            return
+        with self._latest_condition:
+            input_frames = self._input_frame_count
+            overwritten_frames = self._overwritten_frame_count
+            pending_frames = int(self._latest_frame is not None)
 
         lines = [
-            f'YOLO timing over latest {len(self.timing_samples)} frames (ms):'
+            f'YOLO timing over latest {len(samples)} processed frames (ms):',
+            '  frames          '
+            f'received={input_frames} processed={self.frame_count} '
+            f'overwritten={overwritten_frames} pending={pending_frames} '
+            f'worker_errors={self._worker_error_count}',
         ]
         labels = (
             ('before_callback', 'source stamp -> callback'),
-            ('convert', 'ROS image -> OpenCV'),
+            ('worker_wait', 'callback -> inference worker'),
+            ('convert', 'worker -> OpenCV image'),
+            ('preprocess', 'Ultralytics preprocess'),
+            ('inference', 'TensorRT inference reported by Ultralytics'),
+            ('postprocess', 'Ultralytics postprocess/NMS'),
+            ('model_other', 'model() wall time not in speed fields'),
             ('model', 'Ultralytics model()'),
             ('extract', 'boxes GPU -> CPU'),
+            ('processing', 'worker -> cones publish'),
             ('total', 'callback -> cones publish'),
             ('e2e', 'source stamp -> cones publish'),
         )
         for key, label in labels:
             lines.append(
-                f'  {key:<15} {self._format_timing_stat(self.timing_samples, key)} '
+                f'  {key:<15} {self._format_timing_stat(samples, key)} '
                 f'[{label}]'
             )
         self.get_logger().info(
             '\n'.join(lines)
         )
 
-    def _process_image(self, image_msg, cv_image, callback_start, callback_ros):
+    def _process_image(self, pending: PendingFrame, worker_start: float):
+        image_msg = pending.message
+        if self.use_compressed:
+            cv_image = self._decode_compressed(image_msg)
+        else:
+            cv_image = self.bridge.imgmsg_to_cv2(image_msg, 'bgr8')
         if not cv_image.flags['C_CONTIGUOUS']:
             cv_image = np.ascontiguousarray(cv_image)
         converted_time = time.perf_counter()
@@ -408,6 +572,8 @@ class YOLOConeDetector(Node):
             verbose=False,
         )
         model_end = time.perf_counter()
+        model_wall_ms = (model_end - model_start) * 1000.0
+        model_speed = self._model_speed_ms(results, model_wall_ms)
         extracted = self._extract_boxes(results)
         extracted_time = time.perf_counter()
 
@@ -422,11 +588,13 @@ class YOLOConeDetector(Node):
         self._record_and_maybe_log_timing(
             image_msg.header,
             {
-                'callback_start': callback_start,
-                'callback_ros': callback_ros,
+                'callback_start': pending.callback_start,
+                'callback_ros': pending.callback_ros,
+                'worker_start': worker_start,
                 'converted': converted_time,
                 'model_start': model_start,
                 'model_end': model_end,
+                'model_speed': model_speed,
                 'extracted': extracted_time,
                 'published': published_time,
             },
@@ -436,36 +604,10 @@ class YOLOConeDetector(Node):
             self._publish_debug_image(cv_image, extracted, image_msg.header)
 
     def image_only_callback(self, image_msg: Image):
-        callback_start = time.perf_counter()
-        callback_ros = self.get_clock().now().nanoseconds * 1e-9
-        if not self._should_process():
-            return
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(image_msg, 'bgr8')
-            self._process_image(
-                image_msg, cv_image, callback_start, callback_ros
-            )
-        except Exception as error:
-            self.get_logger().error(
-                f'Error in image callback: {error}\n{traceback.format_exc()}'
-            )
+        self._enqueue_latest_frame(image_msg)
 
     def compressed_image_callback(self, image_msg: CompressedImage):
-        callback_start = time.perf_counter()
-        callback_ros = self.get_clock().now().nanoseconds * 1e-9
-        if not self._should_process():
-            return
-        try:
-            self._process_image(
-                image_msg,
-                self._decode_compressed(image_msg),
-                callback_start,
-                callback_ros,
-            )
-        except Exception as error:
-            self.get_logger().error(
-                f'Error in compressed-image callback: {error}\n{traceback.format_exc()}'
-            )
+        self._enqueue_latest_frame(image_msg)
 
 
 def main(args=None):
