@@ -219,6 +219,7 @@ private:
     struct ColorUpdateSnapshot {
         std::vector<uint8_t> colors;
         std::vector<std::string> decisions;
+        size_t applied_colors{0};
     };
 
     struct CsvConeRow {
@@ -413,6 +414,8 @@ private:
         if (!running_.compare_exchange_strong(expected, false)) {
             return;
         }
+        // Exclude draining debug/CSV/showcase queues from the output rates.
+        stop_wall_time_ = std::chrono::steady_clock::now();
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -445,6 +448,7 @@ private:
     }
 
     void lidar_callback(const LidarMsg::ConstSharedPtr& msg) {
+        const auto callback_start = std::chrono::steady_clock::now();
         lidar_received_.fetch_add(1, std::memory_order_relaxed);
         const double lidar_stamp = stamp_to_sec(msg->header.stamp);
 
@@ -488,8 +492,13 @@ private:
         map_msg.header = msg->header;
         map_msg.track = std::move(output_cones);
         map_pub_->publish(map_msg);
+        const auto published_at = std::chrono::steady_clock::now();
+        record_map_latency(lidar_stamp, callback_start, published_at);
 
         lidar_published_.fetch_add(1, std::memory_order_relaxed);
+        if (colored_count > 0) {
+            fused_maps_published_.fetch_add(1, std::memory_order_relaxed);
+        }
         lidar_cones_published_.fetch_add(
             msg->cones.size(), std::memory_order_relaxed);
         colored_cones_published_.fetch_add(
@@ -948,6 +957,11 @@ private:
                 task.lidar_frame,
                 fusion_result.fused_cones,
                 stamp_to_sec(task.camera_msg->header.stamp));
+            // Count frames that actually wrote/confirmed at least one track
+            // color, rather than frames merely queued or processed.
+            if (color_snapshot.applied_colors > 0) {
+                camera_applied_.fetch_add(1, std::memory_order_relaxed);
+            }
 
             fusion_processed_.fetch_add(1, std::memory_order_relaxed);
             const size_t matched_count = fusion_result.matches.size();
@@ -1041,6 +1055,7 @@ private:
                 track.pending_color_count = 0;
                 track.last_color_stamp = camera_stamp;
                 color_updates_.fetch_add(1, std::memory_order_relaxed);
+                ++snapshot.applied_colors;
                 snapshot.colors[i] = track.color;
                 snapshot.decisions[i] = "本帧匹配成功";
                 continue;
@@ -1051,6 +1066,7 @@ private:
                 track.pending_color_count = 0;
                 track.last_color_stamp = camera_stamp;
                 color_updates_.fetch_add(1, std::memory_order_relaxed);
+                ++snapshot.applied_colors;
                 snapshot.colors[i] = track.color;
                 snapshot.decisions[i] = "本帧颜色确认";
                 continue;
@@ -1070,6 +1086,7 @@ private:
                 track.pending_color_count = 0;
                 track.last_color_stamp = camera_stamp;
                 color_updates_.fetch_add(1, std::memory_order_relaxed);
+                ++snapshot.applied_colors;
                 snapshot.decisions[i] = "颜色冲突，已修改";
             } else {
                 snapshot.decisions[i] = "颜色冲突，保持原色";
@@ -1784,70 +1801,75 @@ private:
         }
     }
 
+    void record_map_latency(
+        double source_stamp,
+        std::chrono::steady_clock::time_point callback_start,
+        std::chrono::steady_clock::time_point published_at) {
+        const double node_ms = std::chrono::duration<double, std::milli>(
+            published_at - callback_start).count();
+        const double source_ms =
+            (static_cast<double>(get_clock()->now().nanoseconds()) * 1e-9 -
+             source_stamp) * 1000.0;
+        // Match the detector's basic age sanity bound. Simulated ROS time can
+        // pause/speed up, so it cannot measure actual upstream wall latency.
+        const bool source_valid = !get_parameter("use_sim_time").as_bool() &&
+            source_stamp > 0.0 && source_ms >= 0.0 && source_ms < 60000.0;
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        node_to_map_total_ms_ += node_ms;
+        ++node_to_map_samples_;
+        if (source_valid) {
+            source_to_map_total_ms_ += source_ms;
+            ++source_to_map_samples_;
+        }
+    }
+
     void print_final_summary() {
         const double runtime = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - start_wall_time_).count();
-        const size_t total_cones = lidar_cones_published_.load();
-        const size_t colored_cones = colored_cones_published_.load();
-        const double color_ratio = total_cones > 0
-            ? 100.0 * static_cast<double>(colored_cones) /
-                  static_cast<double>(total_cones)
-            : 0.0;
-        const TimingSnapshot timing = timing_snapshot();
-
+            stop_wall_time_.value_or(std::chrono::steady_clock::now()) -
+            start_wall_time_).count();
+        const size_t lidar_received = lidar_received_.load();
+        const size_t lidar_published = lidar_published_.load();
+        const size_t camera_received = camera_received_.load();
+        const size_t camera_applied = camera_applied_.load();
+        const auto ratio = [](size_t used, size_t received) {
+            return received > 0
+                ? 100.0 * static_cast<double>(used) / received : 0.0;
+        };
+        const auto rate = [runtime](size_t count) {
+            return runtime > 0.0 ? static_cast<double>(count) / runtime : 0.0;
+        };
+        // stop() has joined the fusion worker before this snapshot is printed.
+        std::lock_guard<std::mutex> lock(stats_mutex_);
         std::cout << "\n======================================================\n"
-                  << " Fusion Node final health summary\n"
+                  << " Fusion Node final summary\n"
                   << "======================================================\n"
                   << std::fixed << std::setprecision(2)
-                  << "Runtime:                    " << runtime << " s\n"
-                  << "LiDAR received/published:   " << lidar_received_.load()
-                  << " / " << lidar_published_.load() << "\n"
-                  << "LiDAR internal loss:        "
-                  << (lidar_received_.load() - lidar_published_.load()) << "\n"
-                  << "Camera received/accepted:   " << camera_received_.load()
-                  << " / " << camera_accepted_.load() << "\n"
-                  << "Camera expired/no history:  " << camera_expired_.load()
-                  << " / " << camera_without_lidar_history_.load() << "\n"
-                  << "Camera pending queued/recovered: "
-                  << camera_pending_queued_.load() << " / "
-                  << camera_pending_recovered_.load() << "\n"
-                  << "Camera pending timeout/overflow/shutdown: "
-                  << camera_pending_timeout_.load() << " / "
-                  << camera_pending_overflow_.load() << " / "
-                  << camera_pending_shutdown_.load() << "\n"
-                  << "Camera high latency:        "
-                  << camera_high_latency_.load() << "\n"
-                  << "Camera tasks superseded:    "
-                  << camera_tasks_superseded_.load() << "\n"
-                  << "Camera tasks expired in queue: "
-                  << camera_tasks_expired_in_queue_.load() << "\n"
-                  << "Fusion tasks processed:     "
-                  << fusion_processed_.load() << "\n"
-                  << "Camera age p50/p95/max:      " << timing.age_p50 << " / "
-                  << timing.age_p95 << " / " << timing.age_max << " ms\n"
-                  << "Sync difference p95:        " << timing.sync_p95 << " ms\n"
-                  << "Fusion processing p95:      " << timing.fusion_p95 << " ms\n"
-                  << "Max fusion queue depth:      "
-                  << max_fusion_queue_depth_.load() << "\n"
-                  << "Colored cone ratio:         " << color_ratio << " %\n"
-                  << "Color updates/conflicts:    " << color_updates_.load()
-                  << " / " << color_conflicts_.load() << "\n"
-                  << "Unknown color mappings:     "
-                  << camera_unknown_colors_.load() << "\n"
-                  << "CSV frames written/dropped: "
-                  << csv_frames_written_.load() << " / "
-                  << csv_dropped_frames_.load() << "\n"
-                  << "CSV write errors:           "
-                  << csv_write_errors_.load() << "\n"
-                  << "Showcase queued/saved:      "
-                  << showcase_frames_enqueued_.load() << " / "
-                  << showcase_frames_written_.load() << "\n"
-                  << "Showcase errors/max queue:  "
-                  << showcase_write_errors_.load() << " / "
-                  << showcase_max_queue_depth_.load() << "\n"
-                  << "Showcase missing-cloud skip: "
-                  << showcase_frames_without_cloud_.load() << "\n"
-                  << "======================================================\n"
+                  << "LiDAR received/published:   " << lidar_received << " / "
+                  << lidar_published << " (" << ratio(lidar_published, lidar_received)
+                  << "% published)\n"
+                  << "Camera received/applied:    " << camera_received << " / "
+                  << camera_applied << " (" << ratio(camera_applied, camera_received)
+                  << "% applied)\n"
+                  << "LiDAR output rate:          " << rate(lidar_published) << " Hz\n"
+                  << "Fused Map publish rate:     " << rate(fused_maps_published_.load())
+                  << " Hz\n"
+                  << "Mean pointcloud -> Map:     ";
+        if (source_to_map_samples_ > 0) {
+            std::cout << source_to_map_total_ms_ / source_to_map_samples_ << " ms";
+        } else if (node_to_map_samples_ == 0) {
+            std::cout << "n/a (no Map published)";
+        } else {
+            std::cout << "n/a (invalid source clock or use_sim_time)";
+        }
+        std::cout << " (valid " << source_to_map_samples_ << "/"
+                  << node_to_map_samples_ << ")\n"
+                  << "Mean detection rx -> Map:   ";
+        if (node_to_map_samples_ > 0) {
+            std::cout << node_to_map_total_ms_ / node_to_map_samples_ << " ms\n";
+        } else {
+            std::cout << "n/a (no Map published)\n";
+        }
+        std::cout << "======================================================\n"
                   << std::flush;
     }
 
@@ -1917,13 +1939,19 @@ private:
     std::deque<double> camera_age_samples_ms_;
     std::deque<double> sync_diff_samples_ms_;
     std::deque<double> fusion_time_samples_ms_;
+    double source_to_map_total_ms_{0.0};
+    size_t source_to_map_samples_{0};
+    double node_to_map_total_ms_{0.0};
+    size_t node_to_map_samples_{0};
 
     std::atomic<size_t> lidar_received_{0};
     std::atomic<size_t> lidar_published_{0};
+    std::atomic<size_t> fused_maps_published_{0};
     std::atomic<size_t> lidar_cones_published_{0};
     std::atomic<size_t> colored_cones_published_{0};
     std::atomic<size_t> camera_received_{0};
     std::atomic<size_t> camera_accepted_{0};
+    std::atomic<size_t> camera_applied_{0};
     std::atomic<size_t> camera_expired_{0};
     std::atomic<size_t> camera_high_latency_{0};
     std::atomic<size_t> camera_without_lidar_history_{0};
@@ -1963,6 +1991,7 @@ private:
     std::atomic<size_t> csv_write_errors_{0};
 
     const std::chrono::steady_clock::time_point start_wall_time_;
+    std::optional<std::chrono::steady_clock::time_point> stop_wall_time_;
     std::chrono::steady_clock::time_point last_health_wall_time_;
     size_t last_lidar_received_{0};
     size_t last_lidar_published_{0};
