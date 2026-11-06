@@ -1,0 +1,13 @@
+/frame_monitor:
+  ros__parameters:
+    # 订阅者收到消息的时间用于帧率；header.stamp 用于同链路来源追踪。
+    lidar_detection_topic: /detected_cones_bbox
+    yolo_topic: /yolo/cones
+    fusion_topic: /perception/fusion/map
+    # 不缓存完整图像/点云到写盘线程。DDS 仍需传输完整消息，需实机评估开销。
+    subscription_depth: 10
+    writer_queue_capacity: 20000
+    # 单调墙钟调度，在 ROS /clock 暂停时仍会保存。不是最大丢失时长的保证。
+    sync_interval_seconds: 0.1
+    # 运行期间定期生成 HTML；启动即生成首份，不需要按 Ctrl+C 才保存。
+    report_interval_seconds: 5.0

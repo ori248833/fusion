@@ -13,6 +13,11 @@
   <exec_depend>cone_detector</exec_depend>
   <exec_depend>fs_fusion_box</exec_depend>
   <exec_depend>lidar_cone_detector</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>cone_interfaces</exec_depend>
+  <exec_depend>drd25_msgs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

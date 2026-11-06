@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>感知链路帧率回看</title>
+<style>
+:root{color-scheme:dark;--bg:#10151e;--panel:#192231;--border:#314157;--muted:#a9b9ce;--ink:#edf4ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 system-ui,"Microsoft YaHei",sans-serif}
+main{max-width:1440px;margin:auto;padding:28px}h1{font-size:27px;margin:0}h2{font-size:18px;margin:0 0 12px}
+p{margin:6px 0 14px}.muted,small{color:var(--muted)}.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px;margin:16px 0}
+.notice{border-left:3px solid #e5b664;background:#2d281f;padding:12px 16px;border-radius:5px;margin:16px 0;white-space:pre-line}
+.controls{display:flex;gap:14px;align-items:center;flex-wrap:wrap}input,select,button{font:inherit;color:var(--ink);background:#111b29;border:1px solid #496078;border-radius:6px;padding:5px 9px}
+button{cursor:pointer}button:hover{background:#304259}input[type=range]{width:100%;padding:0;accent-color:#58c6ec;cursor:pointer}
+input[type=number]{width:100px}.cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-top:16px}
+.card{border-top:3px solid var(--line);background:var(--panel);border-radius:8px;padding:14px;min-width:0}.rate{font-size:30px;font-weight:650;line-height:1.5}
+.card p{margin:3px 0;color:var(--muted);font-size:13px}canvas{display:block;width:100%;touch-action:pan-y;cursor:crosshair}
+#fps{height:270px}#raster{height:240px}#legend{display:flex;flex-wrap:wrap;gap:16px;font-size:13px;margin:8px 0}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
+.scroll{max-height:320px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;text-align:left}th,td{padding:8px;border-bottom:1px solid var(--border);white-space:nowrap}
+thead{position:sticky;top:0;background:var(--panel)}tbody tr[data-index]{cursor:pointer}tbody tr[data-index]:hover{background:#2b3c52}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.stamp{font-family:ui-monospace,monospace;overflow-wrap:anywhere}#links{white-space:pre-line}
+@media(max-width:950px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.split{grid-template-columns:1fr}main{padding:14px}}
+</style>
+<main>
+  <h1>感知链路帧率回看</h1>
+  <p id="run" class="muted"></p>
+  <div id="integrity" class="notice"></div>
+  <section class="panel">
+    <div class="controls">
+      <button id="play">播放</button><button id="previous">上一帧</button><button id="next">下一帧</button>
+      <label>时刻 <input id="time" type="number" min="0" step="0.001"> s</label>
+      <label>统计窗口 <select id="window"><option value="0.5">0.5 s</option><option value="1" selected>1 s</option><option value="2">2 s</option><option value="5">5 s</option></select></label>
+      <label>逐帧区间 <select id="zoom"><option value="local" selected>选中时刻附近</option><option value="all">全程</option></select></label>
+    </div>
+    <input id="slider" aria-label="运行时间轴" type="range" min="0" step="0.001" value="0">
+    <div id="windowLabel" class="muted"></div>
+    <div class="cards" id="cards"></div>
+  </section>
+  <section class="panel">
+    <h2>五路帧率 · 按监测接收时间</h2>
+    <div id="legend"></div><canvas id="fps" aria-label="五路帧率曲线"></canvas>
+    <p class="muted">点击曲线或拖动滑块定位。阴影是选中统计窗口；曲线使用同一窗口计算。启动窗口未满时按实际经过时间计算。</p>
+  </section>
+  <section class="panel">
+    <h2>逐帧时间条</h2><canvas id="raster" aria-label="五路逐帧时间条"></canvas>
+    <p class="muted">每条短线是一条收到的消息，空检测也计为一帧。红色背景为长间隔候选；密集区域的线条可能重叠。</p>
+  </section>
+  <div class="split">
+    <section class="panel">
+      <h2>长间隔候选</h2>
+      <label>阈值 = 本路全程帧间隔中位数 × <select id="multiplier"><option value="1.8">1.8</option><option value="3" selected>3</option><option value="5">5</option></select></label>
+      <p class="muted">此规则定位停顿，不能证明丢帧。启动等待单独显示；稳定低帧率也可能没有长间隔。</p>
+      <div class="scroll"><table><thead><tr><th>数据流</th><th>区间 / s</th><th>时长</th><th>类型</th></tr></thead><tbody id="gaps"></tbody></table></div>
+    </section>
+    <section class="panel">
+      <h2>全程统计</h2>
+      <div class="scroll"><table><thead><tr><th>数据流</th><th>记录帧数</th><th>首帧 / s</th><th>重复戳</th><th>时间戳回退</th></tr></thead><tbody id="totals"></tbody></table></div>
+      <p class="muted" id="policy"></p>
+    </section>
+  </div>
+  <section class="panel">
+    <h2>窗口逐帧记录与来源追踪</h2>
+    <div class="controls"><label>数据流 <select id="stream"></select></label><span id="rowCount" class="muted"></span></div>
+    <div class="scroll"><table><thead><tr><th>本路序号</th><th>接收时刻 / s</th><th>与上一帧间隔 / ms</th><th>原始 header 时间戳 / s</th><th>Header 状态</th></tr></thead><tbody id="events"></tbody></table></div>
+    <p id="links">点击一帧查看同链路的相同采集时间戳候选。原始纳秒整数完整保存在 frames.csv 中。</p>
+  </section>
+  <p class="muted">统计口径：独立监测订阅者实际收到消息的频率，并非生产节点内部发布计数。监测订阅自身可能漏收；启动发现、停止在途任务、主动跳帧、时钟回退和重复时间戳都会影响关联。相同时间戳仅提供候选对应，未观测到输出不等于确认丢帧。相机与雷达之间不做逐帧相等匹配。Map 连续也不代表相机持续参与融合。接收时刻之差不是模型处理延迟。文件完全离线可用。</p>
+</main>
+<script id="run-data" type="application/json">__RUN_DATA__</script>
+<script>__METRICS_JS__</script>
+<script>
+'use strict';
+const D=JSON.parse(document.getElementById('run-data').textContent);
+const keys=Object.keys(D.labels), colors=['#52c8ee','#e9b85c','#76dbb2','#bd99fc','#fb8d9e'];
+const $=id=>document.getElementById(id), f=(n,d=3)=>n===null||n===undefined?'—':Number(n).toFixed(d);
+const duration=D.duration, end=Math.max(duration,0.001);
+let time=0, width=1, selected=keys[0], gapMap={}, playing=false, playLast=null, chartRange=[0,end];
+const stampMaps=Object.fromEntries(keys.map(k=>{
+  const map=new Map();D.streams[k].forEach((e,i)=>{
+    if(e[1]!==null){if(!map.has(e[1]))map.set(e[1],[]);map.get(e[1]).push(i);}
+  });return [k,map];
+}));
+const chains={lidar_raw:['lidar_raw','lidar_detection','fusion'],lidar_detection:['lidar_raw','lidar_detection','fusion'],fusion:['lidar_raw','lidar_detection','fusion'],camera_raw:['camera_raw','yolo'],yolo:['camera_raw','yolo']};
+function sourceSeconds(stamp){
+  if(stamp===null)return '不可用';
+  const value=BigInt(stamp), sign=value<0n?'-':'', abs=value<0n?-value:value;
+  return sign+String(abs/1000000000n)+'.'+String(abs%1000000000n).padStart(9,'0');
+}
+function textCell(row,value){const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell);return cell;}
+function init(){
+  $('run').textContent='系统启动时间：'+D.metadata.started_system+' · 时长 '+f(duration)+' s · 时间零点：监测启动';
+  const warnings=[];
+  if(D.metadata.synthetic)warnings.push('人工构造示例，仅用于界面和计算验证，不是实测结果。');
+  if(D.preview)warnings.push('运行中生成的持久快照，未确认正常结束；运行可能仍在继续或已意外中断。重新打开/刷新可查看已保存的最新报告，下次启动监测器将自动恢复未关闭的旧运行。');
+  if(D.recovered)warnings.push('中断恢复报告：真实结束时刻未知，时间轴截至最后恢复的记录/保存检查点，不表示断电时刻。');
+  if(D.metadata.checkpoint)warnings.push('最近数据保存检查点：'+D.metadata.checkpoint.system_time+' · 运行 '+f(D.metadata.checkpoint.elapsed_ns/1e9)+' s。尚在内存/队列中的尾部记录可能丢失。');
+  if(D.metadata.state!=='finished')warnings.push('运行记录状态：'+D.metadata.state+'。请结合 run.json 检查完整性。');
+  const dropped=Object.values(D.metadata.recorder_dropped_rows||{}).reduce((a,b)=>a+b,0);
+  if(dropped)warnings.push('监测写盘队列丢弃 '+dropped+' 行：这些缺口属于监测记录自身。');
+  if(D.metadata.writer_error)warnings.push('写盘错误：'+D.metadata.writer_error);
+  if(D.skipped_csv_rows)warnings.push('跳过损坏/不完整 CSV 行：'+D.skipped_csv_rows);
+  const missing=Object.values(D.checkpoint_shortfall||{}).reduce((a,b)=>a+b,0);
+  if(missing||D.checkpoint_bytes_missing)warnings.push('保存检查点与现存 CSV 不一致：缺少 '+missing+' 条已提交记录 / '+(D.checkpoint_bytes_missing||0)+' 字节，可能存在截断或存储损坏，记录不完整。');
+  if(D.metadata.config_copy_errors?.length)warnings.push('部分配置快照复制失败，见 run.json。');
+  warnings.push('当前仅记录外部接收事件；节点内部覆盖、队列丢弃及融合配对原因尚未记录。');
+  $('integrity').textContent=warnings.join('\n');
+  $('slider').max=String(duration);$('time').max=String(duration);
+  keys.forEach((key,i)=>{
+    const option=document.createElement('option');option.value=key;option.textContent=D.labels[key];$('stream').appendChild(option);
+    const card=document.createElement('div');card.className='card';card.style.setProperty('--line',colors[i]);
+    const title=document.createElement('div');title.textContent=D.labels[key];card.appendChild(title);
+    ['rate','count','silence','age','status'].forEach(name=>{const el=document.createElement(name==='rate'?'div':'p');el.id=key+'-'+name;if(name==='rate')el.className='rate';card.appendChild(el);});$('cards').appendChild(card);
+    const legend=document.createElement('span'),dot=document.createElement('i');dot.className='dot';dot.style.background=colors[i];legend.appendChild(dot);legend.appendChild(document.createTextNode(D.labels[key]));$('legend').appendChild(legend);
+    const s=D.summary.streams[key],row=document.createElement('tr');
+    [D.labels[key],s.recorded_frames,f(s.first_receive_seconds),s.repeated_source_stamps,s.source_stamp_regressions].forEach(v=>textCell(row,v));$('totals').appendChild(row);
+  });
+  const cap=D.metadata.parameters?.yolo_max_fps;
+  $('policy').textContent='YOLO 配置推理上限：'+(cap>0?cap+' Hz':'不限频/未记录')+'；采用最新帧覆盖策略。采集时间戳无效数见 summary.json。';
+  updateGaps();setTime(Math.min(1,duration));
+}
+function updateGaps(){
+  gapMap={};const rows=[];
+  keys.forEach(key=>{
+    const result=FrameMetrics.gaps(D.streams[key],duration,Number($('multiplier').value));gapMap[key]=result;
+    result.intervals.forEach(g=>rows.push({...g,key}));
+    const first=D.streams[key][0];
+    if(first&&first[0]>0)rows.push({key,start:0,end:first[0],kind:'启动等待（不判定丢帧）'});
+    if(!first)rows.push({key,start:0,end:duration,kind:'全程未观测到输出'});
+  });
+  rows.sort((a,b)=>a.start-b.start);$('gaps').replaceChildren();
+  rows.slice(0,1000).forEach(g=>{
+    const row=document.createElement('tr');row.dataset.index='gap';
+    [D.labels[g.key],f(g.start)+'–'+f(g.end),f((g.end-g.start)*1000,1)+' ms',g.kind].forEach(v=>textCell(row,v));
+    row.onclick=()=>{selected=g.key;$('stream').value=selected;setTime((g.start+g.end)/2);};$('gaps').appendChild(row);
+  });
+  if(rows.length>1000){const row=document.createElement('tr');textCell(row,'仅列出前 1000 个区间');$('gaps').appendChild(row);}
+}
+function setTime(value,preserveInput=false){time=Math.max(0,Math.min(duration,Number(value)||0));$('slider').value=time;if(!preserveInput)$('time').value=f(time);render();}
+function setupCanvas(id){
+  const canvas=$(id), rect=canvas.getBoundingClientRect(),scale=window.devicePixelRatio||1;
+  canvas.width=Math.round(rect.width*scale);canvas.height=Math.round(rect.height*scale);
+  const ctx=canvas.getContext('2d');ctx.scale(scale,scale);ctx.font='12px system-ui';
+  return {ctx,w:rect.width,h:rect.height};
+}
+function axes(ctx,w,h,left,right,ymax){
+  ctx.strokeStyle='#334359';ctx.fillStyle='#a9b9ce';ctx.textAlign='right';
+  for(let i=0;i<=4;i++){const y=h-30-(h-48)*i/4;ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();ctx.fillText(f(ymax*i/4,1),left-8,y+4);}
+  ctx.textAlign='center';for(let i=0;i<=5;i++)ctx.fillText(f(duration*i/5,2)+' s',left+(w-left-right)*i/5,h-7);
+}
+function drawFPS(){
+  const {ctx,w,h}=setupCanvas('fps'),left=48,right=16,bottom=h-30,top=18;
+  const x=t=>left+t/end*(w-left-right),samples=Math.max(100,Math.min(900,Math.round(w)));
+  let ymax=1;const curves=keys.map(key=>Array.from({length:samples+1},(_,i)=>{
+    const t=duration*i/samples,hz=FrameMetrics.windowStats(D.streams[key],t,width).hz;
+    if(hz!==null)ymax=Math.max(ymax,hz);return [t,hz];
+  }));ymax=Math.ceil(ymax*1.1);axes(ctx,w,h,left,right,ymax);
+  ctx.fillStyle='#58c6ec18';ctx.fillRect(x(Math.max(0,time-width)),top,x(time)-x(Math.max(0,time-width)),bottom-top);
+  curves.forEach((curve,i)=>{ctx.strokeStyle=colors[i];ctx.lineWidth=1.8;ctx.beginPath();let started=false;curve.forEach(([t,hz])=>{if(hz===null)return;const y=bottom-hz/ymax*(bottom-top);if(started)ctx.lineTo(x(t),y);else{ctx.moveTo(x(t),y);started=true;}});ctx.stroke();});
+  ctx.strokeStyle='#ffffff';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x(time),top);ctx.lineTo(x(time),bottom);ctx.stroke();
+}
+function drawRaster(){
+  const {ctx,w,h}=setupCanvas('raster'),left=Math.min(140,w*.27),right=16;
+  const span=Math.max(width*4,2),start=$('zoom').value==='all'?0:Math.max(0,Math.min(time-span/2,Math.max(0,duration-span)));
+  const stop=$('zoom').value==='all'?end:Math.min(end,start+span);chartRange=[start,stop];
+  const x=t=>left+(t-start)/Math.max(stop-start,0.001)*(w-left-right);
+  keys.forEach((key,i)=>{
+    const y=30+i*39;ctx.fillStyle='#a9b9ce';ctx.textAlign='right';ctx.fillText(D.labels[key],left-8,y+4);
+    ctx.strokeStyle='#314157';ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();
+    gapMap[key].intervals.forEach(g=>{const a=Math.max(start,g.start),b=Math.min(stop,g.end);if(b>a){ctx.fillStyle='#f06a7330';ctx.fillRect(x(a),y-12,x(b)-x(a),24);}});
+    const events=D.streams[key],a=FrameMetrics.lowerBound(events,start),b=FrameMetrics.upperBound(events,stop);
+    ctx.strokeStyle=colors[i];ctx.beginPath();let lastPixel=-1;
+    for(let j=a;j<b;j++){const px=Math.round(x(events[j][0]));if(px===lastPixel)continue;lastPixel=px;ctx.moveTo(px,y-9);ctx.lineTo(px,y+9);}ctx.stroke();
+  });
+  ctx.fillStyle='#58c6ec18';ctx.fillRect(x(Math.max(start,time-width)),12,Math.max(0,x(time)-x(Math.max(start,time-width))),188);
+  ctx.strokeStyle='#ffffff';ctx.beginPath();ctx.moveTo(x(time),12);ctx.lineTo(x(time),201);ctx.stroke();
+  ctx.fillStyle='#a9b9ce';ctx.textAlign='center';for(let i=0;i<=4;i++)ctx.fillText(f(start+(stop-start)*i/4)+' s',left+(w-left-right)*i/4,h-8);
+}
+function showLinks(index){
+  const event=D.streams[selected][index];if(!event)return;
+  if(event[1]===null){$('links').textContent='该帧 Header 不可用，无法按采集时间戳关联。';return;}
+  const lines=['选中 '+D.labels[selected]+' #'+event[2]+' · 接收 '+f(event[0],6)+' s · 采集戳 '+sourceSeconds(event[1])+' s'];
+  chains[selected].forEach(key=>{
+    const matches=stampMaps[key].get(event[1])||[];
+    lines.push(D.labels[key]+'：'+(matches.length?matches.slice(0,8).map(i=>'#'+D.streams[key][i][2]+' @ '+f(D.streams[key][i][0],6)+' s').join('；')+(matches.length>8?' … 共 '+matches.length+' 条':''):'全程未观测到相同采集戳'));
+    if(matches.length>1)lines.push('  时间戳重复，无法唯一确定对应关系（可能含回放循环或重复发布）。');
+  });
+  lines.push('以上为全程候选匹配，不受当前窗口边界限制。未观测到不能直接判定丢帧。');$('links').textContent=lines.join('\n');
+}
+function render(){
+  const start=Math.max(0,time-width);$('windowLabel').textContent='选中 '+f(time)+' s / '+f(duration)+' s · 统计区间 '+(start===0?'[':'(')+f(start)+', '+f(time)+'] s'+(time<width?' · 启动窗口未满':'');
+  keys.forEach(key=>{
+    const s=FrameMetrics.windowStats(D.streams[key],time,width);
+    $(key+'-rate').textContent=f(s.hz,1)+' Hz';$(key+'-count').textContent='窗口帧数 '+s.count;
+    $(key+'-silence').textContent='窗口最大静默 '+f(s.silence*1000,1)+' ms';
+    $(key+'-age').textContent='距上一帧 '+(s.age===null?'—':f(s.age*1000,1)+' ms');$(key+'-status').textContent=s.status;
+  });
+  const events=D.streams[selected],s=FrameMetrics.windowStats(events,time,width);$('events').replaceChildren();
+  const begin=Math.max(s.begin,s.end-200);$('rowCount').textContent='窗口 '+s.count+' 帧；显示最近 '+Math.min(200,s.count)+' 帧';
+  for(let i=begin;i<s.end;i++){
+    const e=events[i],row=document.createElement('tr');row.dataset.index=i;
+    [e[2],f(e[0],6),i?f((e[0]-events[i-1][0])*1000,2):'—',sourceSeconds(e[1]),e[3]].forEach(v=>textCell(row,v));
+    row.onclick=()=>showLinks(i);$('events').appendChild(row);
+  }
+  drawFPS();drawRaster();
+}
+$('slider').oninput=e=>setTime(e.target.value);$('time').oninput=e=>setTime(e.target.value,true);$('time').onchange=e=>setTime(e.target.value);
+$('window').onchange=e=>{width=Number(e.target.value);render();};$('zoom').onchange=render;
+$('stream').onchange=e=>{selected=e.target.value;$('links').textContent='点击一帧查看同链路时间戳候选。';render();};
+$('multiplier').onchange=()=>{updateGaps();render();};
+$('previous').onclick=()=>{const e=D.streams[selected],i=FrameMetrics.lowerBound(e,time)-1;if(i>=0)setTime(e[i][0]);};
+$('next').onclick=()=>{const e=D.streams[selected],i=FrameMetrics.upperBound(e,time);if(i<e.length)setTime(e[i][0]);};
+$('fps').onclick=e=>{const r=$('fps').getBoundingClientRect();setTime((e.clientX-r.left-48)/(r.width-64)*end);};
+$('raster').onclick=e=>{const r=$('raster').getBoundingClientRect(),left=Math.min(140,r.width*.27);setTime(chartRange[0]+(e.clientX-r.left-left)/(r.width-left-16)*(chartRange[1]-chartRange[0]));};
+function advance(now){if(!playing)return;if(playLast!==null)setTime(time+(now-playLast)/1000);playLast=now;if(time>=duration){playing=false;$('play').textContent='播放';return;}requestAnimationFrame(advance);}
+$('play').onclick=()=>{playing=!playing;$('play').textContent=playing?'暂停':'播放';playLast=null;if(playing){if(time>=duration)setTime(0);requestAnimationFrame(advance);}};
+window.addEventListener('resize',render);init();
+</script>
+</html>
