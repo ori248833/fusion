@@ -44,6 +44,17 @@ const FrameMetrics = (() => {
     const middle = sorted.length >>> 1;
     return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
   }
+  function intervalStats(events, time, maxIntervals=100) {
+    const end = upperBound(events, time), begin = Math.max(0, end-maxIntervals-1);
+    const count = Math.max(0, end-begin-1);
+    if (!count) return {hz:null, count:0, min:null, max:null, std:null};
+    const deltas=[];
+    for(let i=begin+1;i<end;i++)deltas.push(events[i][0]-events[i-1][0]);
+    const mean=deltas.reduce((a,b)=>a+b,0)/count;
+    const variance=deltas.reduce((sum,d)=>sum+(d-mean)**2,0)/count;
+    return {hz:mean>0?1/mean:null, count, min:Math.min(...deltas),
+      max:Math.max(...deltas), std:Math.sqrt(variance)};
+  }
   function gaps(events, duration, multiplier) {
     const periods = events.slice(1).map((e, i) => e[0] - events[i][0]).filter(x => x > 0);
     const typical = median(periods);
@@ -58,6 +69,6 @@ const FrameMetrics = (() => {
     }
     return {typical, threshold, intervals};
   }
-  return {upperBound, lowerBound, windowStats, median, gaps};
+  return {upperBound, lowerBound, windowStats, intervalStats, median, gaps};
 })();
 if (typeof module !== 'undefined') module.exports = FrameMetrics;

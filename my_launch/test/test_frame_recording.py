@@ -196,6 +196,29 @@ class RecordingTests(unittest.TestCase):
             finally:
                 recorder.close()
 
+    def test_periodic_report_generation_runs_in_a_different_process(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = create_run_directory(root)
+            recorder = FrameRecorder(run, {})
+            reports = PeriodicReports(recorder, interval=.1)
+            try:
+                self.assertNotEqual(reports._process.pid, os.getpid())
+                self.assertTrue(reports._process.is_alive())
+                recorder.record('lidar_raw', header(), 1)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    summary = json.loads((run / 'summary.json').read_text('utf-8'))
+                    if summary['streams']['lidar_raw']['recorded_frames'] == 1:
+                        break
+                    time.sleep(.02)
+                self.assertEqual(summary['streams']['lidar_raw']['recorded_frames'], 1)
+                self.assertIsNone(reports.error)
+            finally:
+                reports.close()
+                recorder.close()
+            self.assertFalse(reports._process.is_alive())
+            self.assertIsNone(reports.error)
+
     def test_hard_kill_preserves_periodic_report_and_recovers_without_close(self):
         # A process kill checks absence of finally/close; it is NOT a power-cut test.
         program = '''

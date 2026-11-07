@@ -89,8 +89,8 @@ def _mkdir_durable(path):
 class RunLease:
     """Use an OS-released lock to keep recovery away from a running recorder."""
 
-    def __init__(self, run_dir):
-        self.path = Path(run_dir) / '.recorder.lock'
+    def __init__(self, run_dir, filename='.recorder.lock'):
+        self.path = Path(run_dir) / filename
         self.handle = None
 
     def acquire(self):

@@ -18,4 +18,14 @@ assert.deepEqual(M.gaps(events, 6, 3).intervals.map(g => [g.start, g.end]), [[2,
 assert.deepEqual(M.gaps([], 6, 3).intervals, []);
 assert.deepEqual(M.gaps([[1]], 6, 3).intervals, []); // Not enough intervals to infer a rate.
 assert.equal(M.median([0.2,0.1,0.3,0.4]), 0.25);
+assert.equal(M.intervalStats(events, 3.5).hz, 2); // Unlike the zero window rate, no tail silence.
+assert.equal(M.intervalStats(events, 3.5).count, 4);
+assert.equal(M.intervalStats(events, 4, 1).hz, .5); // Last one interval is [2,4].
+assert.equal(M.intervalStats([], 3).hz, null);
+assert.equal(M.intervalStats([[1]], 3).hz, null);
+assert.equal(M.intervalStats([[1],[1]], 3).hz, null);
+assert.equal(M.intervalStats([[1],[2],[100]], 3).count, 1); // No future intervals.
+const constant = Array.from({length:101},(_,i)=>[i/10]);
+assert.equal(M.intervalStats(constant,10).hz,10);
+assert.equal(M.intervalStats(constant,10).count,100);
 console.log('Frame metrics: window boundaries, silence, startup, gaps and empty streams passed.');

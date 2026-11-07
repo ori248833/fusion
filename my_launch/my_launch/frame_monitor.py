@@ -15,7 +15,7 @@ from cone_interfaces.msg import ConeArray
 from drd25_msgs.msg import Map
 from lidar_cone_detector.msg import ThreeDConeArray
 
-from .frame_recording import create_run_directory, FrameRecorder, sync_directory
+from .frame_recording import create_run_directory, FrameRecorder, STREAMS, sync_directory
 from .frame_report import generate_report, PeriodicReports
 
 
@@ -37,6 +37,7 @@ class FrameMonitor(Node):
             'sync_interval_seconds': 0.1,
             'report_interval_seconds': 5.0,
             'yolo_max_fps': 20.0,
+            'enabled_streams': [key for key, _ in STREAMS],
         }
         for key, value in defaults.items():
             self.declare_parameter(key, value)
@@ -50,6 +51,10 @@ class FrameMonitor(Node):
             ('yolo', ConeArray, params['yolo_topic']),
             ('fusion', Map, params['fusion_topic']),
         )
+        enabled = set(params['enabled_streams'])
+        if not enabled or enabled - dict(STREAMS).keys():
+            raise ValueError(f'Invalid enabled_streams: {params["enabled_streams"]}')
+        specifications = tuple(item for item in specifications if item[0] in enabled)
         run_dir = create_run_directory(params['output_root'])
         config_dir = run_dir / 'configs'
         config_dir.mkdir()
@@ -71,6 +76,7 @@ class FrameMonitor(Node):
             'topics': {key: topic for key, _, topic in specifications},
             'config_copy_errors': config_errors,
             'qos': 'BEST_EFFORT / VOLATILE / KEEP_LAST',
+            'report_generation': 'separate_spawn_process',
             'time_zero': 'monitor initialization; earlier startup frames are unobserved',
         }, capacity=int(params['writer_queue_capacity']),
             sync_interval=float(params['sync_interval_seconds']))
@@ -121,8 +127,10 @@ class FrameMonitor(Node):
 
     def finish(self, reason):
         """Close the writer even if the ROS context has already been shut down."""
-        self.reports.close()
-        self.recorder.close(reason)
+        try:
+            self.reports.close()
+        finally:
+            self.recorder.close(reason)
         report = generate_report(self.recorder.run_dir)
         print(f'Frame-rate report saved: {report}', flush=True)
 

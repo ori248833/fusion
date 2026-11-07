@@ -5,9 +5,11 @@ from collections import Counter
 import csv
 from datetime import datetime
 import json
+import multiprocessing
 from pathlib import Path
+import queue
 import statistics
-import threading
+import time
 
 from .frame_recording import RunLease, STREAMS, write_json, write_text_atomic
 
@@ -96,6 +98,9 @@ def summarize(data):
             'last_receive_seconds': events[-1][0] if events else None,
             'max_interarrival_seconds': max(gaps) if gaps else None,
             'median_interarrival_seconds': statistics.median(gaps) if gaps else None,
+            'interarrival_average_hz': len(gaps) / sum(gaps) if gaps and sum(gaps) > 0 else None,
+            'callback_count_at_checkpoint': data['metadata'].get('received_counts', {}).get(key),
+            'writer_dropped_rows': data['metadata'].get('recorder_dropped_rows', {}).get(key, 0),
             'invalid_headers': sum(event[1] is None for event in events),
             'repeated_source_stamps': len(stamps) - len(set(stamps)),
             'source_stamp_regressions': sum(b < a for a, b in zip(stamps, stamps[1:])),
@@ -121,6 +126,16 @@ def summarize(data):
 def generate_report(run_dir, metadata=None, checkpoint_only=False):
     """Generate one HTML file that works offline when opened directly."""
     run_dir = Path(run_dir)
+    lease = RunLease(run_dir, filename='.report.lock')
+    if not lease.acquire():
+        raise BlockingIOError(f'Another process is updating the report: {run_dir}')
+    try:
+        return _generate_report(run_dir, metadata, checkpoint_only)
+    finally:
+        lease.close()
+
+
+def _generate_report(run_dir, metadata, checkpoint_only):
     data = load_run(run_dir, metadata=metadata, checkpoint_only=checkpoint_only)
     data['summary'] = summarize(data)
     write_json(run_dir / 'summary.json', data['summary'])
@@ -157,7 +172,8 @@ def recover_runs(root, exclude=None):
                 continue
             # Recheck after taking ownership: the old recorder may just have closed.
             metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
-            if metadata.get('state') not in ('recording', 'incomplete') or 'duration_ns' in metadata:
+            if (metadata.get('state') not in ('recording', 'incomplete')
+                    or 'duration_ns' in metadata):
                 continue
             metadata.update({
                 'state': 'interrupted',
@@ -174,43 +190,97 @@ def recover_runs(root, exclude=None):
     return recovered, errors
 
 
-class PeriodicReports:
-    """Update durable reports in a background thread, independent of ROS time."""
-
-    def __init__(self, recorder, interval=5.0):
-        self.recorder = recorder
-        self.interval = max(0.1, float(interval))
-        self.error = None
-        self.recovery_errors = []
-        self._stop = threading.Event()
-        # Even a run shorter than one report interval has an openable HTML file.
-        generate_report(recorder.run_dir, metadata=recorder.snapshot(), checkpoint_only=True)
-        self._thread = threading.Thread(
-            target=self._run, name='frame-report-writer', daemon=True)
-        self._thread.start()
-
-    def _run(self):
+def _report_worker(run_dir, interval, stop, status):
+    """Keep CSV parsing, JSON encoding and HTML generation outside the collector."""
+    run_dir = Path(run_dir)
+    parent = multiprocessing.parent_process()
+    while not stop.is_set() and (parent is None or parent.is_alive()):
+        error, recovery_errors = None, []
         try:
-            recovered, self.recovery_errors = recover_runs(
-                self.recorder.run_dir.parent, exclude=self.recorder.run_dir)
+            recovered, recovery_errors = recover_runs(run_dir.parent, exclude=run_dir)
             for folder in recovered:
                 print(f'Recovered interrupted frame recording: {folder}', flush=True)
-        except Exception as error:
-            self.recovery_errors = [f'{type(error).__name__}: {error}']
-        while not self._stop.wait(self.interval):
+            generate_report(run_dir, checkpoint_only=True)
+        except Exception as exception:
+            error = f'{type(exception).__name__}: {exception}'
+        try:
+            status.put_nowait((error, recovery_errors))
+        except queue.Full:
             try:
-                generate_report(
-                    self.recorder.run_dir, metadata=self.recorder.snapshot(),
-                    checkpoint_only=True)
-                self.error = None
-            except Exception as error:
-                # Preserve the previous report and keep raw recording independent.
-                self.error = f'{type(error).__name__}: {error}'
+                status.get_nowait()
+                status.put_nowait((error, recovery_errors))
+            except (queue.Empty, queue.Full):
+                pass
+        # A hard-killed collector cannot signal stop. Watch its OS process sentinel.
+        deadline = time.monotonic() + interval
+        while not stop.is_set() and time.monotonic() < deadline:
+            if parent is not None and not parent.is_alive():
+                return
+            stop.wait(min(.1, max(0, deadline - time.monotonic())))
+
+
+class PeriodicReports:
+    """Build reports in a spawned process, sharing no collector Python GIL."""
+
+    def __init__(self, recorder, interval=5.0):
+        self.interval = max(0.1, float(interval))
+        self._error = None
+        self._recovery_errors = []
+        self._closed = False
+        context = multiprocessing.get_context('spawn')
+        self._stop = context.Event()
+        self._status = context.Queue(maxsize=8)
+        # Even a run shorter than one report interval has an openable HTML file.
+        generate_report(recorder.run_dir, metadata=recorder.snapshot(), checkpoint_only=True)
+        self._process = context.Process(
+            target=_report_worker,
+            args=(str(recorder.run_dir), self.interval, self._stop, self._status),
+            name='frame-report-writer', daemon=True)
+        self._process.start()
+
+    def _refresh_status(self, check_exit=True):
+        if self._closed:
+            return
+        while True:
+            try:
+                self._error, self._recovery_errors = self._status.get_nowait()
+            except queue.Empty:
+                break
+            except (OSError, EOFError) as error:
+                self._error = f'Report status channel failed: {error}'
+                break
+        if check_exit and self._process.exitcode is not None:
+            self._error = f'Report process exited unexpectedly: {self._process.exitcode}'
+
+    @property
+    def error(self):
+        """Return report errors without parsing any recording data in this process."""
+        self._refresh_status()
+        return self._error
+
+    @property
+    def recovery_errors(self):
+        """Return the latest recovery status from the report process."""
+        self._refresh_status()
+        return self._recovery_errors
 
     def close(self):
         """Finish a current atomic report update before the final shutdown report."""
+        if self._closed:
+            return
         self._stop.set()
-        self._thread.join()
+        self._process.join(timeout=30)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=5)
+            error = 'Report shutdown timed out; previous atomic report is preserved'
+        else:
+            error = None
+        self._refresh_status(check_exit=False)
+        if error is not None:
+            self._error = error
+        self._closed = True
+        self._status.close()
 
 
 def main():

@@ -33,7 +33,7 @@ def generate_launch_description():
         # score_thresh: CenterHead heatmap 分数阈值。越高误检越少、后处理越快，但可能漏检。
         # my_cone_anchorfree.yaml 的默认是 0.30；低到 0.05 会显著增加 TopK/NMS 压力。
         arg(
-            'score_thresh', '0.3',
+            'score_thresh', '0.15',
             'Detection score threshold. Higher is faster/fewer false positives; lower improves recall but costs NMS.'),
 
         # nms_thresh: BEV rotated NMS IoU 阈值。越低抑制越强，重复框更少；越高保留更多近邻框。

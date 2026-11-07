@@ -38,7 +38,7 @@ thead{position:sticky;top:0;background:var(--panel)}tbody tr[data-index]{cursor:
   <section class="panel">
     <h2>五路帧率 · 按监测接收时间</h2>
     <div id="legend"></div><canvas id="fps" aria-label="五路帧率曲线"></canvas>
-    <p class="muted">点击曲线或拖动滑块定位。阴影是选中统计窗口；曲线使用同一窗口计算。启动窗口未满时按实际经过时间计算。</p>
+    <p class="muted">曲线及大号数字 = 窗口帧数 / 窗口秒数，用于定位停顿。卡片另列最近最多 100 个接收间隔的均频，便于与 topic hz 对照；该均频不包含最后一帧之后的静默，两者不能直接等同。</p>
   </section>
   <section class="panel">
     <h2>逐帧时间条</h2><canvas id="raster" aria-label="五路逐帧时间条"></canvas>
@@ -71,6 +71,7 @@ thead{position:sticky;top:0;background:var(--panel)}tbody tr[data-index]{cursor:
 'use strict';
 const D=JSON.parse(document.getElementById('run-data').textContent);
 const keys=Object.keys(D.labels), colors=['#52c8ee','#e9b85c','#76dbb2','#bd99fc','#fb8d9e'];
+const enabled=new Set(D.metadata.parameters?.enabled_streams||keys);
 const $=id=>document.getElementById(id), f=(n,d=3)=>n===null||n===undefined?'—':Number(n).toFixed(d);
 const duration=D.duration, end=Math.max(duration,0.001);
 let time=0, width=1, selected=keys[0], gapMap={}, playing=false, playLast=null, chartRange=[0,end];
@@ -89,6 +90,7 @@ function textCell(row,value){const cell=document.createElement('td');cell.textCo
 function init(){
   $('run').textContent='系统启动时间：'+D.metadata.started_system+' · 时长 '+f(duration)+' s · 时间零点：监测启动';
   const warnings=[];
+  if(enabled.size<keys.length)warnings.push('本次仅监测：'+keys.filter(k=>enabled.has(k)).map(k=>D.labels[k]).join('、')+'；关闭的数据流不用于判断断流。');
   if(D.metadata.synthetic)warnings.push('人工构造示例，仅用于界面和计算验证，不是实测结果。');
   if(D.preview)warnings.push('运行中生成的持久快照，未确认正常结束；运行可能仍在继续或已意外中断。重新打开/刷新可查看已保存的最新报告，下次启动监测器将自动恢复未关闭的旧运行。');
   if(D.recovered)warnings.push('中断恢复报告：真实结束时刻未知，时间轴截至最后恢复的记录/保存检查点，不表示断电时刻。');
@@ -105,22 +107,23 @@ function init(){
   $('integrity').textContent=warnings.join('\n');
   $('slider').max=String(duration);$('time').max=String(duration);
   keys.forEach((key,i)=>{
-    const option=document.createElement('option');option.value=key;option.textContent=D.labels[key];$('stream').appendChild(option);
+    const option=document.createElement('option');option.value=key;option.textContent=D.labels[key];option.disabled=!enabled.has(key);$('stream').appendChild(option);
     const card=document.createElement('div');card.className='card';card.style.setProperty('--line',colors[i]);
     const title=document.createElement('div');title.textContent=D.labels[key];card.appendChild(title);
-    ['rate','count','silence','age','status'].forEach(name=>{const el=document.createElement(name==='rate'?'div':'p');el.id=key+'-'+name;if(name==='rate')el.className='rate';card.appendChild(el);});$('cards').appendChild(card);
+    ['rate','count','interval','silence','age','status'].forEach(name=>{const el=document.createElement(name==='rate'?'div':'p');el.id=key+'-'+name;if(name==='rate')el.className='rate';card.appendChild(el);});$('cards').appendChild(card);
     const legend=document.createElement('span'),dot=document.createElement('i');dot.className='dot';dot.style.background=colors[i];legend.appendChild(dot);legend.appendChild(document.createTextNode(D.labels[key]));$('legend').appendChild(legend);
     const s=D.summary.streams[key],row=document.createElement('tr');
     [D.labels[key],s.recorded_frames,f(s.first_receive_seconds),s.repeated_source_stamps,s.source_stamp_regressions].forEach(v=>textCell(row,v));$('totals').appendChild(row);
   });
   const cap=D.metadata.parameters?.yolo_max_fps;
   $('policy').textContent='YOLO 配置推理上限：'+(cap>0?cap+' Hz':'不限频/未记录')+'；采用最新帧覆盖策略。采集时间戳无效数见 summary.json。';
-  updateGaps();setTime(Math.min(1,duration));
+  selected=keys.find(k=>enabled.has(k))||keys[0];$('stream').value=selected;updateGaps();setTime(Math.min(1,duration));
 }
 function updateGaps(){
   gapMap={};const rows=[];
   keys.forEach(key=>{
     const result=FrameMetrics.gaps(D.streams[key],duration,Number($('multiplier').value));gapMap[key]=result;
+    if(!enabled.has(key))return;
     result.intervals.forEach(g=>rows.push({...g,key}));
     const first=D.streams[key][0];
     if(first&&first[0]>0)rows.push({key,start:0,end:first[0],kind:'启动等待（不判定丢帧）'});
@@ -188,8 +191,15 @@ function showLinks(index){
 function render(){
   const start=Math.max(0,time-width);$('windowLabel').textContent='选中 '+f(time)+' s / '+f(duration)+' s · 统计区间 '+(start===0?'[':'(')+f(start)+', '+f(time)+'] s'+(time<width?' · 启动窗口未满':'');
   keys.forEach(key=>{
+    if(!enabled.has(key)){
+      $(key+'-rate').textContent='未监测';
+      ['count','interval','silence','age','status'].forEach(field=>$(key+'-'+field).textContent='—');
+      return;
+    }
     const s=FrameMetrics.windowStats(D.streams[key],time,width);
+    const intervals=FrameMetrics.intervalStats(D.streams[key],time);
     $(key+'-rate').textContent=f(s.hz,1)+' Hz';$(key+'-count').textContent='窗口帧数 '+s.count;
+    $(key+'-interval').textContent='最近 '+intervals.count+' 个间隔均频 '+f(intervals.hz,1)+' Hz';
     $(key+'-silence').textContent='窗口最大静默 '+f(s.silence*1000,1)+' ms';
     $(key+'-age').textContent='距上一帧 '+(s.age===null?'—':f(s.age*1000,1)+' ms');$(key+'-status').textContent=s.status;
   });

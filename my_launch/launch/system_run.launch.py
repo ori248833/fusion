@@ -47,7 +47,12 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(lidar_package_path, 'launch', 'infer_trt_cuda.launch.py')
         ),
-        launch_arguments={'input_topic': LaunchConfiguration('input_topic')}.items(),
+        launch_arguments={
+            'input_topic': LaunchConfiguration('input_topic'),
+            'enable_latency_test': LaunchConfiguration('lidar_enable_latency_test'),
+            'latency_log_every_n': LaunchConfiguration('lidar_latency_log_every_n'),
+            'queue_log_interval_sec': LaunchConfiguration('lidar_queue_log_interval_sec'),
+        }.items(),
     )            
 
     # ==========================================
@@ -103,6 +108,9 @@ def generate_launch_description():
             default_value=str(Path.home() / 'perception_runs')),
         DeclareLaunchArgument('frame_monitor_use_sim_time', default_value='false'),
         DeclareLaunchArgument('input_topic', default_value='/lidar_points'),
+        DeclareLaunchArgument('lidar_enable_latency_test', default_value='false'),
+        DeclareLaunchArgument('lidar_latency_log_every_n', default_value='10'),
+        DeclareLaunchArgument('lidar_queue_log_interval_sec', default_value='5.0'),
         monitor_node,
         yolo_node,  
         lidar_launch,
