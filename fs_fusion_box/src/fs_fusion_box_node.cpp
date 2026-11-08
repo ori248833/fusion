@@ -1,6 +1,7 @@
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -14,6 +15,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -24,8 +26,11 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include <ament_index_cpp/get_package_share_directory.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -102,6 +107,7 @@ public:
     using LidarMsg = lidar_cone_detector::msg::ThreeDConeArray;
     using CameraMsg = cone_interfaces::msg::ConeArray;
     using CloudMsg = sensor_msgs::msg::PointCloud2;
+    using MapMsg = drd25_msgs::msg::Map;
 
     FusionNode()
         : Node("fusion_box_node"),
@@ -131,6 +137,7 @@ public:
             rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(),
             std::bind(&FusionNode::camera_callback, this, std::placeholders::_1));
 
+        initialize_depth_fallback();
         parameter_callback_handle_ = add_on_set_parameters_callback(
             std::bind(
                 &FusionNode::on_parameters_changed,
@@ -162,6 +169,11 @@ public:
     }
 
 private:
+    struct DepthCandidateFrame {
+        MapMsg::ConstSharedPtr msg;
+        std::chrono::steady_clock::time_point received;
+    };
+
     struct Track {
         uint64_t id{0};
         double x{0.0};
@@ -246,10 +258,31 @@ private:
         std::vector<CsvConeRow> cones;
     };
 
+    using ReplayClock = std::chrono::steady_clock;
+
+    struct ReplayEvent {
+        size_t index{0};
+        double elapsed_sec{0.0};
+        double lidar_received_sec{0.0};
+        builtin_interfaces::msg::Time stamp;
+        LidarMsg::ConstSharedPtr lidar;
+        std::vector<drd25_msgs::msg::Cone> map_cones;
+        size_t yolo_count{0};
+        std::optional<std::array<size_t, 3>> rates;
+    };
+
+    using CsvRecord = std::variant<CsvFrame, ReplayEvent>;
+
     void declare_parameters() {
         // Existing externally configured parameters are preserved.
         declare_parameter("sync_window", 0.04);
         declare_parameter("lidar_frame", "hesai_lidar");
+        rcl_interfaces::msg::ParameterDescriptor startup_only;
+        startup_only.read_only = true;
+        declare_parameter("depth_fallback.mode", "off", startup_only);
+        declare_parameter("depth_fallback.max_range_m", 4.0, startup_only);
+        declare_parameter("depth_fallback.max_age_sec", 0.15, startup_only);
+        declare_parameter("depth_fallback.duplicate_distance_m", 0.40, startup_only);
         declare_parameter("overlap_threshold", 0.60);
         declare_parameter("image_width", 640);
         declare_parameter("image_height", 480);
@@ -440,10 +473,88 @@ private:
             showcase_thread_.join();
         }
 
-        csv_running_.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(csv_mutex_);
+            csv_running_.store(false, std::memory_order_relaxed);
+        }
         csv_cv_.notify_all();
         if (csv_thread_.joinable()) {
             csv_thread_.join();
+        }
+    }
+
+    void initialize_depth_fallback() {
+        const auto mode = get_parameter("depth_fallback.mode").as_string();
+        if (mode == "off" || mode == "preview") {
+            return;
+        }
+        if (mode != "map") {
+            throw std::invalid_argument("depth_fallback.mode must be off, preview or map");
+        }
+        depth_range_m_ = get_parameter("depth_fallback.max_range_m").as_double();
+        depth_max_age_sec_ = get_parameter("depth_fallback.max_age_sec").as_double();
+        depth_duplicate_distance_m_ =
+            get_parameter("depth_fallback.duplicate_distance_m").as_double();
+        for (const double value : {depth_range_m_, depth_max_age_sec_,
+                                   depth_duplicate_distance_m_}) {
+            if (!std::isfinite(value) || value <= 0.0) {
+                throw std::invalid_argument("depth_fallback thresholds must be finite and positive");
+            }
+        }
+        depth_candidate_sub_ = create_subscription<MapMsg>(
+            "/perception/camera/depth_candidates",
+            rclcpp::QoS(rclcpp::KeepLast(2)).best_effort(),
+            [this](MapMsg::ConstSharedPtr msg) {
+                // This and lidar_callback run on the same single-threaded executor.
+                depth_candidates_.push_back({std::move(msg), std::chrono::steady_clock::now()});
+                if (depth_candidates_.size() > 8) {
+                    depth_candidates_.pop_front();
+                }
+            });
+        RCLCPP_INFO(get_logger(), "ZED depth fallback enabled on Map within %.2f m", depth_range_m_);
+    }
+
+    void append_depth_fallback(
+        const LidarMsg& lidar, double lidar_stamp, std::vector<drd25_msgs::msg::Cone>& cones) {
+        if (depth_candidates_.empty() || lidar.header.frame_id.empty() || lidar_stamp <= 0.0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const double ros_now = enable_camera_age_gate_ ? get_clock()->now().seconds() : 0.0;
+        const MapMsg* nearest = nullptr;
+        double nearest_delta = max_sync_diff_;
+        // Visit newest arrivals first so a tie uses the newest result.
+        for (auto entry = depth_candidates_.rbegin(); entry != depth_candidates_.rend(); ++entry) {
+            if (std::chrono::duration<double>(now - entry->received).count() > depth_max_age_sec_) {
+                break;
+            }
+            const auto& candidate = *entry->msg;
+            const double stamp = stamp_to_sec(candidate.header.stamp);
+            const double delta = std::abs(stamp - lidar_stamp);
+            if (candidate.header.frame_id != lidar.header.frame_id || stamp <= 0.0 ||
+                (enable_camera_age_gate_ && (ros_now < stamp || ros_now - stamp > depth_max_age_sec_)) ||
+                delta > nearest_delta || (nearest && delta == nearest_delta)) {
+                continue;
+            }
+            nearest = &candidate;
+            nearest_delta = delta;
+        }
+        if (!nearest) {
+            return;
+        }
+        for (const auto& candidate : nearest->track) {
+            if (!is_confirmed_map_color(candidate.color) ||
+                !std::isfinite(candidate.x) || !std::isfinite(candidate.y) ||
+                candidate.x <= 0.0 || std::hypot(candidate.x, candidate.y) > depth_range_m_) {
+                continue;
+            }
+            const bool duplicate = std::any_of(cones.begin(), cones.end(), [&](const auto& cone) {
+                return std::hypot(cone.x - candidate.x, cone.y - candidate.y) <=
+                       depth_duplicate_distance_m_;
+            });
+            if (!duplicate) {
+                cones.push_back(candidate);
+            }
         }
     }
 
@@ -486,14 +597,27 @@ private:
             prune_lidar_history_locked(lidar_stamp);
         }
 
-        // LiDAR is the authoritative, real-time output trigger. No camera work,
-        // projection, visualization, or worker queue can block this publish.
+        // The optional supplement only reads finished XY candidates. Publishing
+        // never waits for camera inference, depth processing or a future frame.
+        if (depth_candidate_sub_) {
+            append_depth_fallback(*msg, lidar_stamp, output_cones);
+        }
         drd25_msgs::msg::Map map_msg;
         map_msg.header = msg->header;
         map_msg.track = std::move(output_cones);
         map_pub_->publish(map_msg);
         const auto published_at = std::chrono::steady_clock::now();
         record_map_latency(lidar_stamp, callback_start, published_at);
+        if (replay_enabled_) {
+            ReplayEvent event;
+            event.stamp = msg->header.stamp;
+            event.lidar = msg;
+            event.map_cones = std::move(map_msg.track);
+            event.lidar_received_sec = replay_elapsed(callback_start);
+            replay_lidar_times_.push_back(callback_start);
+            replay_map_times_.push_back(published_at);
+            queue_replay_event(std::move(event), published_at);
+        }
 
         lidar_published_.fetch_add(1, std::memory_order_relaxed);
         if (colored_count > 0) {
@@ -564,6 +688,14 @@ private:
 
     void camera_callback(const CameraMsg::ConstSharedPtr& msg) {
         camera_received_.fetch_add(1, std::memory_order_relaxed);
+        if (replay_enabled_) {
+            const auto received_at = ReplayClock::now();
+            ReplayEvent event;
+            event.stamp = msg->header.stamp;
+            event.yolo_count = msg->cones.size();
+            replay_yolo_times_.push_back(received_at);
+            queue_replay_event(std::move(event), received_at);
+        }
 
         const double camera_stamp = stamp_to_sec(msg->header.stamp);
         double camera_age = 0.0;
@@ -1154,6 +1286,64 @@ private:
         stream.write(bom, sizeof(bom));
     }
 
+    void initialize_replay() {
+        replay_csv_.open(csv_run_directory_ / "replay.csv", std::ios::binary);
+        replay_csv_.imbue(std::locale::classic());
+        replay_csv_ << "event_id,kind,elapsed_s,lidar_received_s,source_stamp_ns,frame_id,"
+                       "lidar_count,yolo_count,map_count,lidar_hz,yolo_hz,map_hz,"
+                       "x_m,y_m,z_m,map_color\n";
+        replay_csv_.flush();
+        if (!replay_csv_) {
+            RCLCPP_ERROR(get_logger(), "Failed to create replay.csv");
+            return;
+        }
+        replay_start_ = ReplayClock::now();
+        replay_enabled_ = true;
+        try {
+            const auto share = std::filesystem::path(
+                ament_index_cpp::get_package_share_directory("fs_fusion_box"));
+            std::filesystem::copy_file(share / "replay.html", csv_run_directory_ / "replay.html");
+        } catch (const std::exception& error) {
+            RCLCPP_WARN(get_logger(), "Failed to copy replay viewer: %s", error.what());
+        }
+    }
+
+    double replay_elapsed(ReplayClock::time_point now) const {
+        return std::chrono::duration<double>(now - replay_start_).count();
+    }
+
+    void queue_replay_event(ReplayEvent event, ReplayClock::time_point now) {
+        // These clocks are updated by the single-threaded executor, before any
+        // recording drops. Count messages in (now - 1 s, now], including empties.
+        const auto cutoff = now - 1s;
+        const auto rate = [cutoff](auto& times) {
+            while (!times.empty() && times.front() <= cutoff) {
+                times.pop_front();
+            }
+            return times.size();
+        };
+        const std::array<size_t, 3> rates{
+            rate(replay_lidar_times_), rate(replay_yolo_times_), rate(replay_map_times_)};
+        event.index = ++replay_event_index_;
+        event.elapsed_sec = replay_elapsed(now);
+        if (now - replay_start_ >= 1s) {
+            event.rates = rates;
+        }
+        {
+            std::lock_guard<std::mutex> lock(csv_mutex_);
+            if (replay_queued_ >= visual_csv_queue_size_) {
+                ++replay_dropped_;
+                if (replay_dropped_ == 1 || replay_dropped_ % 100 == 0) {
+                    RCLCPP_WARN(get_logger(), "Replay queue full; dropped events=%zu", replay_dropped_);
+                }
+                return;
+            }
+            ++replay_queued_;
+            csv_queue_.emplace_back(std::move(event));
+        }
+        csv_cv_.notify_one();
+    }
+
     void initialize_csv_logging() {
         if (!enable_visual_csv_) {
             return;
@@ -1185,6 +1375,7 @@ private:
             }
             std::filesystem::create_directories(csv_run_directory_);
 
+            initialize_replay();
             csv_runtime_enabled_ = true;
             csv_running_.store(true, std::memory_order_relaxed);
             csv_thread_ = std::thread(&FusionNode::csv_writer_loop, this);
@@ -1194,6 +1385,7 @@ private:
                 csv_run_directory_.string().c_str());
         } catch (const std::exception& error) {
             csv_runtime_enabled_ = false;
+            replay_enabled_ = false;
             csv_running_.store(false, std::memory_order_relaxed);
             RCLCPP_ERROR(
                 get_logger(),
@@ -1276,7 +1468,7 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(csv_mutex_);
-            if (csv_queue_.size() >= visual_csv_queue_size_) {
+            if (csv_queue_.size() - replay_queued_ >= visual_csv_queue_size_) {
                 const size_t dropped =
                     csv_dropped_frames_.fetch_add(
                         1, std::memory_order_relaxed) + 1;
@@ -1296,7 +1488,7 @@ private:
 
     void csv_writer_loop() {
         while (true) {
-            CsvFrame frame;
+            CsvRecord record;
             {
                 std::unique_lock<std::mutex> lock(csv_mutex_);
                 csv_cv_.wait(lock, [&] {
@@ -1307,10 +1499,23 @@ private:
                     !csv_running_.load(std::memory_order_relaxed)) {
                     break;
                 }
-                frame = std::move(csv_queue_.front());
+                record = std::move(csv_queue_.front());
                 csv_queue_.pop_front();
+                if (std::holds_alternative<ReplayEvent>(record)) {
+                    --replay_queued_;
+                }
             }
 
+            if (const auto* event = std::get_if<ReplayEvent>(&record)) {
+                if (replay_csv_) {
+                    write_replay_event(*event);
+                    if (!replay_csv_) {
+                        RCLCPP_ERROR(get_logger(), "Failed to write replay.csv at event %zu", event->index);
+                    }
+                }
+                continue;
+            }
+            const auto& frame = std::get<CsvFrame>(record);
             try {
                 write_csv_frame(frame);
                 csv_frames_written_.fetch_add(1, std::memory_order_relaxed);
@@ -1323,6 +1528,48 @@ private:
                     error.what());
             }
         }
+    }
+
+    void write_replay_event(const ReplayEvent& event) {
+        const auto stamp_ns = static_cast<int64_t>(event.stamp.sec) * 1000000000LL +
+            event.stamp.nanosec;
+        replay_csv_ << event.index << ',' << (event.lidar ? "lidar_map" : "yolo") << ','
+                    << std::fixed << std::setprecision(9) << event.elapsed_sec << ',';
+        if (event.lidar) {
+            replay_csv_ << event.lidar_received_sec;
+        }
+        replay_csv_ << ',' << stamp_ns << ',';
+        if (event.lidar) {
+            replay_csv_ << '"';
+            for (char ch : event.lidar->header.frame_id) {
+                if (ch == '"') {
+                    replay_csv_ << '"';
+                }
+                replay_csv_ << ch;
+            }
+            replay_csv_ << "\"," << event.lidar->cones.size() << ",," << event.map_cones.size();
+        } else {
+            replay_csv_ << ",," << event.yolo_count << ',';
+        }
+        replay_csv_ << ',';
+        if (event.rates) {
+            replay_csv_ << (*event.rates)[0] << ',' << (*event.rates)[1] << ',' << (*event.rates)[2];
+        } else {
+            replay_csv_ << ",,";
+        }
+        replay_csv_ << ",,,,\n";
+
+        if (event.lidar) {
+            for (const auto& cone : event.lidar->cones) {
+                replay_csv_ << event.index << ",lidar_cone,,,,,,,,,,,"
+                            << cone.center.x << ',' << cone.center.y << ',' << cone.center.z << ",\n";
+            }
+            for (const auto& cone : event.map_cones) {
+                replay_csv_ << event.index << ",map_cone,,,,,,,,,,,"
+                            << cone.x << ',' << cone.y << ",," << map_color_name(cone.color) << '\n';
+            }
+        }
+        replay_csv_.flush();
     }
 
     void write_csv_frame(const CsvFrame& frame) {
@@ -1887,6 +2134,12 @@ private:
     double track_timeout_{1.00};
     unsigned int color_conflict_confirmations_{2};
 
+    double depth_range_m_{0.0};
+    double depth_max_age_sec_{0.0};
+    double depth_duplicate_distance_m_{0.0};
+    std::deque<DepthCandidateFrame> depth_candidates_;
+    rclcpp::Subscription<MapMsg>::SharedPtr depth_candidate_sub_;
+
     rclcpp::Publisher<drd25_msgs::msg::Map>::SharedPtr map_pub_;
     rclcpp::Subscription<LidarMsg>::SharedPtr lidar_sub_;
     rclcpp::Subscription<CameraMsg>::SharedPtr camera_sub_;
@@ -1985,10 +2238,20 @@ private:
     std::thread csv_thread_;
     std::mutex csv_mutex_;
     std::condition_variable csv_cv_;
-    std::deque<CsvFrame> csv_queue_;
+    std::deque<CsvRecord> csv_queue_;
     std::atomic<size_t> csv_frames_written_{0};
     std::atomic<size_t> csv_dropped_frames_{0};
     std::atomic<size_t> csv_write_errors_{0};
+
+    bool replay_enabled_{false};
+    ReplayClock::time_point replay_start_;
+    std::deque<ReplayClock::time_point> replay_lidar_times_;
+    std::deque<ReplayClock::time_point> replay_yolo_times_;
+    std::deque<ReplayClock::time_point> replay_map_times_;
+    size_t replay_event_index_{0};
+    size_t replay_queued_{0};
+    size_t replay_dropped_{0};
+    std::ofstream replay_csv_;
 
     const std::chrono::steady_clock::time_point start_wall_time_;
     std::optional<std::chrono::steady_clock::time_point> stop_wall_time_;

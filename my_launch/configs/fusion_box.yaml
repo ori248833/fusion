@@ -3,7 +3,7 @@
     # ========== 坐标系与时间配对 ==========
     # LiDAR frame 名称，用于融合结果和可视化的坐标语义。
     lidar_frame: "hesai_lidar"
-    # LiDAR 与 Camera 原始采集时间戳的最大差值，单位秒。
+    # LiDAR 与 Camera 原始采集时间戳的最大差值，单位秒。上色与深度补位共用。
     # 它只判断是否属于同一观测时刻，不能用来容忍 YOLO 推理延迟。
     max_sync_diff: 0.10
 
@@ -30,6 +30,22 @@
     track_timeout: 1.00
     # 新颜色与已有颜色冲突时，连续多少次相同观测后才覆盖旧颜色。
     color_conflict_confirmations: 2
+
+    # ========== ZED 近距离锥桶补位（改后重启） ==========
+    depth_fallback:
+      # off: 不启动深度补位；preview: 仅发布候选；map: 将合格候选补入 Map。
+      mode: "off"
+      # ZED 驱动单独启动。preview/map 需要启用深度图并保留采集时间戳。
+      # 若也要关闭驱动里的深度计算，在 ZED 驱动配置中将 depth_mode 设为 NONE。
+      depth_topic: "/zed/zed_node/depth/depth_registered"
+      # LiDAR 原点前方的平面半径，单位米。
+      max_range_m: 4.0
+      # YOLO 与深度严格同帧，深度候选与 LiDAR 配对使用上面的 max_sync_diff。
+      # 候选缓存的有效期。启用 enable_camera_age_gate 时也检查采集时间。
+      max_age_sec: 0.15
+      # 已有 LiDAR 锥桶附近的相机候选视为重复，单位米。
+      duplicate_distance_m: 0.40
+      min_yolo_confidence: 0.50
 
     # ========== 融合可视化与健康日志 ==========
     # 2D 合成调试图总开关；false 时不构造可视化数据，不影响 Map 输出。
@@ -62,17 +78,17 @@
     showcase_height_max: 5.0
 
     # ========== CSV 融合调试 ==========
-    # 只保存至少成功匹配一对 LiDAR/YOLO 框的融合帧。
+    # 同时启用逐帧匹配调试 CSV 和消息回放 CSV。
     enable_visual_csv: true
     # 每次启动会新建运行文件夹；每帧子目录含 fusion.csv 和 cones.csv。
     visual_csv_output_directory: "/home/dian/DRd26_ws/src/my_launch/fusion_debug"
-    # 每 N 个成功融合帧保存一次；1 表示全部保存。
+    # 每 N 个成功匹配的调试帧保存一次；1 表示全部保存。
     visual_csv_every_n: 1
-    # 单次运行最多保存的帧数；0 表示不限制。
+    # 逐帧匹配调试的帧数上限；0 表示不限制。replay.csv 连续记录。
     visual_csv_max_frames: 1000
     # true 时，每帧 cones.csv 同时保留未知颜色锥桶。
     visual_csv_include_unknown: true
-    # 后台写盘队列满时只丢弃 CSV，不阻塞融合输出。
+    # 两种 CSV 分别限制待写记录数；队列满时丢弃对应记录。
     visual_csv_queue_size: 1024
     
     # ========== 空间匹配阈值 ==========

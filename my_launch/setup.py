@@ -30,6 +30,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'depth_cone_fallback = my_launch.depth_cone_fallback:main',
             'frame_monitor = my_launch.frame_monitor:main',
             'frame_report = my_launch.frame_report:main',
         ],

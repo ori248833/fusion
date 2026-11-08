@@ -75,6 +75,32 @@ def generate_launch_description():
         ]
     )
 
+    with open(config_file, encoding='utf-8') as config_handle:
+        fusion_settings = yaml.safe_load(config_handle)['/fusion_box_node']['ros__parameters']
+    depth_settings = fusion_settings.get('depth_fallback', {})
+    depth_mode = depth_settings.get('mode', 'off')
+    if depth_mode not in ('off', 'preview', 'map'):
+        raise ValueError('depth_fallback.mode must be off, preview or map')
+    depth_nodes = []
+    if depth_mode != 'off':
+        depth_nodes.append(Node(
+            package='my_launch',
+            executable='depth_cone_fallback',
+            name='depth_cone_fallback',
+            output='screen',
+            parameters=[{
+                'depth_topic': depth_settings['depth_topic'],
+                'max_range_m': depth_settings['max_range_m'],
+                'min_yolo_confidence': depth_settings['min_yolo_confidence'],
+                'lidar_frame': fusion_settings['lidar_frame'],
+                'image_width': fusion_settings['image_width'],
+                'image_height': fusion_settings['image_height'],
+                'intrinsics': [fusion_settings['camera_matrix'][key]
+                               for key in ('fx', 'fy', 'cx', 'cy')],
+                'lidar_to_camera_matrix': fusion_settings['lidar_to_camera_matrix'],
+            }],
+        ))
+
     # ==========================================
     # 4. 组合启动列表
     # ==========================================
@@ -114,6 +140,7 @@ def generate_launch_description():
         monitor_node,
         yolo_node,  
         lidar_launch,
+        *depth_nodes,
         fusion_node,
     ]
 

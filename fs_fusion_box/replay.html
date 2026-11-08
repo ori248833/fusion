@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>融合锥桶回放</title>
+<style>
+  :root { color-scheme: light; font-family: system-ui, sans-serif; color: #18252e; background: #f4f7f8; }
+  body { margin: 0 auto; max-width: 1440px; padding: 24px; }
+  h1 { margin: 0 0 8px; font-size: 1.6rem; }
+  h2 { margin: 0 0 8px; font-size: 1.05rem; }
+  p { margin: 8px 0; }
+  button, select, input { font: inherit; }
+  button, select { padding: 5px 10px; }
+  .muted { color: #495c67; font-size: .9rem; }
+  .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+  #timeline { flex: 1 1 200px; }
+  #clock, .values { font-variant-numeric: tabular-nums; }
+  .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  section { background: #fff; padding: 14px; border: 1px solid #dce4e8; border-radius: 8px; }
+  svg { display: block; width: 100%; height: auto; }
+  svg text { fill: #495c67; font-size: 13px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 5px 16px; font-size: .9rem; }
+  .legend b { margin-right: 4px; }
+  @media (max-width: 960px) { .layout { grid-template-columns: 1fr; } }
+</style>
+<main>
+  <h1>融合锥桶回放</h1>
+  <label>选择同一运行目录里的 <code>replay.csv</code> <input id="file" type="file" accept=".csv,text/csv"></label>
+  <p id="status" class="muted" role="status">载入 CSV 后可播放或拖动时间轴。</p>
+  <div class="toolbar">
+    <button id="play" type="button" disabled>播放</button>
+    <label>速度 <select id="speed"><option value=".5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label>
+    <input id="timeline" aria-label="回放时间（秒）" type="range" min="0" max="0" step="any" value="0" disabled>
+    <output id="clock">0.00 s</output>
+  </div>
+  <div class="layout">
+    <section>
+      <h2>锥桶俯视图</h2>
+      <div class="legend"><span><b>＋</b>雷达检测</span><span><b>○</b>Map 输出（按颜色着色，灰色未知）</span><span><b>◆</b>雷达原点</span></div>
+      <p id="mapInfo" class="muted values">等待雷达和 Map 数据</p>
+      <svg id="map" viewBox="0 0 640 440" role="img" aria-label="雷达原点、雷达检测锥桶与 Map 锥桶俯视图"></svg>
+      <p class="muted">坐标随雷达移动。X 为前向，Y 为横向，单位为米。</p>
+    </section>
+    <section>
+      <h2>检测数量与输出帧率</h2>
+      <div class="legend"><span><b style="color:#9c4913">━</b>YOLO 检测数</span><span><b style="color:#952b55">┅</b>Map 锥桶数</span></div>
+      <div class="legend"><span><b style="color:#215aaf">━</b>雷达 Hz</span><span><b style="color:#6941a5">┅</b>YOLO Hz</span><span><b style="color:#176f5c">┄</b>Map Hz</span></div>
+      <p id="counts" class="muted values">YOLO — · Map —</p>
+      <p id="rates" class="muted values">雷达 — · YOLO — · Map —</p>
+      <svg id="trend" viewBox="0 0 640 310" role="img" aria-label="YOLO 检测数、Map 锥桶数及三路帧率随时间变化，左轴为数量，右轴为帧率"></svg>
+      <p class="muted">帧率取过去 1 秒的消息数，空帧也计数。雷达和 YOLO 按融合节点收到的消息计数，Map 按实际发布计数。启动首秒和超过 1 秒无记录的区间留空。</p>
+    </section>
+  </div>
+</main>
+<script>
+"use strict";
+const element = id => document.getElementById(id);
+const slider = element("timeline");
+const play = element("play");
+const header = "event_id,kind,elapsed_s,lidar_received_s,source_stamp_ns,frame_id,lidar_count,yolo_count,map_count,lidar_hz,yolo_hz,map_hz,x_m,y_m,z_m,map_color";
+const palette = { blue: "#215aaf", orange: "#9c4913", green: "#176f5c", red: "#952b55", purple: "#6941a5" };
+const mapColors = { "蓝色": "#216bd3", "红色": "#cb3838", "大黄锥": "#9d6b04", "小黄锥": "#9d6b04" };
+const chart = { left: 55, right: 585, top: 29, bottom: 269 };
+let events = [], mapFrames = [], yoloFrames = [], duration = 0;
+let mapScale, visibleFrame, cursor, animation = 0, previousTick = null;
+let loadId = 0;
+
+function csvRows(text) {
+  const rows = [];
+  const fields = /("(?:[^"]|"")*"|[^",\r\n]*)(,|\r?\n|$)/gy;
+  let row = [];
+  while (fields.lastIndex < text.length) {
+    const match = fields.exec(text);
+    if (!match || !match[0]) break;
+    const cell = match[1];
+    row.push(cell.startsWith('"') ? cell.slice(1, -1).replace(/""/g, '"') : cell);
+    if (match[2] !== ",") {
+      rows.push(row);
+      row = [];
+    }
+  }
+  return rows;
+}
+
+function parseReplay(text) {
+  const rows = csvRows(text.replace(/^\uFEFF/, ""));
+  if (rows.shift()?.join(",") !== header) throw new Error("请选择新版融合节点生成的 replay.csv。");
+  const result = [];
+  let current, skipped = 0, invalidPoints = 0;
+  const validCount = value => value !== "" && Number.isSafeInteger(Number(value)) && Number(value) >= 0;
+  const finish = () => {
+    if (!current) return;
+    if (current.lidarRows === current.lidarCount && current.mapRows === current.mapCount) {
+      result.push(current);
+    } else {
+      skipped++;
+    }
+  };
+  for (const row of rows) {
+    if (row.length === 1 && row[0] === "") continue;
+    const [id, kind, t, , , frameId, lidarCount, yoloCount, mapCount, lidarHz, yoloHz, mapHz, x, y, , color] = row;
+    if (kind === "lidar_map" || kind === "yolo") {
+      finish();
+      current = undefined;
+      const isMap = kind === "lidar_map";
+      if (row.length !== 16 || !validCount(id) || Number(id) <= (result.at(-1)?.id ?? 0) ||
+          !t || !Number.isFinite(Number(t)) || Number(t) < (result.at(-1)?.time ?? 0) ||
+          !(isMap ? validCount(lidarCount) && validCount(mapCount) : validCount(yoloCount))) {
+        skipped++;
+        continue;
+      }
+      current = {
+        id: Number(id), kind, time: Number(t), frameId,
+        lidarCount: isMap ? Number(lidarCount) : 0,
+        mapCount: isMap ? Number(mapCount) : 0,
+        yoloCount: isMap ? null : Number(yoloCount),
+        rates: [lidarHz, yoloHz, mapHz].map(value => validCount(value) ? Number(value) : null),
+        lidar: [], map: [], lidarRows: 0, mapRows: 0
+      };
+    } else if (row.length === 16 && current?.kind === "lidar_map" && current.id === Number(id) &&
+               (kind === "lidar_cone" || kind === "map_cone")) {
+      const stream = kind === "lidar_cone" ? "lidar" : "map";
+      current[stream + "Rows"]++;
+      if (x && y && Number.isFinite(Number(x)) && Number.isFinite(Number(y))) {
+        current[stream].push({ x: Number(x), y: Number(y), color });
+      } else {
+        invalidPoints++;
+      }
+    } else {
+      skipped++;
+    }
+  }
+  finish();
+  if (!result.length) throw new Error("CSV 中还没有完整的回放事件。");
+  return { events: result, skipped, invalidPoints, missing: result.at(-1).id - result.length };
+}
+
+function svg(parent, tag, attributes, label) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+  if (label !== undefined) node.textContent = label;
+  parent.append(node);
+  return node;
+}
+
+function grid(parent, x1, y1, x2, y2, zero = false) {
+  svg(parent, "line", { x1, y1, x2, y2, stroke: zero ? "#82929c" : "#e1e8eb" });
+}
+
+function calculateMapScale(frames) {
+  let minX = -1, maxX = 1, minY = -1, maxY = 1;
+  for (const frame of frames) {
+    for (const points of [frame.lidar, frame.map]) {
+      for (const point of points) {
+        minX = Math.min(minX, point.x);
+        maxX = Math.max(maxX, point.x);
+        minY = Math.min(minY, point.y);
+        maxY = Math.max(maxY, point.y);
+      }
+    }
+  }
+  const metersPerPixel = Math.max((maxX - minX) / 520, (maxY - minY) / 345);
+  const x = value => 333 + (value - (minX + maxX) / 2) / metersPerPixel;
+  const y = value => 205 - (value - (minY + maxY) / 2) / metersPerPixel;
+  return { x, y, metersPerPixel, minX, maxX, minY, maxY };
+}
+
+function drawMap(frame) {
+  const view = element("map");
+  view.replaceChildren();
+  if (!frame) {
+    svg(view, "text", { x: 320, y: 210, "text-anchor": "middle" }, "此时还没有雷达和 Map 帧");
+    return;
+  }
+  const { x, y, metersPerPixel, minX, maxX, minY, maxY } = mapScale;
+  const span = Math.max(maxX - minX, maxY - minY);
+  const tick = Math.max(1, Math.ceil(span / 8));
+  for (let value = Math.ceil(minX / tick) * tick; value <= maxX; value += tick) {
+    grid(view, x(value), 20, x(value), 395, value === 0);
+    svg(view, "text", { x: x(value), y: 415, "text-anchor": "middle" }, value);
+  }
+  for (let value = Math.ceil(minY / tick) * tick; value <= maxY; value += tick) {
+    grid(view, 54, y(value), 611, y(value), value === 0);
+    svg(view, "text", { x: 43, y: y(value) + 4, "text-anchor": "end" }, value);
+  }
+  svg(view, "text", { x: 615, y: 432, "text-anchor": "end" }, "X（m）");
+  svg(view, "text", { x: 10, y: 15 }, "Y（m）");
+  const origin = svg(view, "rect", {
+    x: x(0) - 4, y: y(0) - 4, width: 8, height: 8, fill: "#18252e",
+    transform: "rotate(45 " + x(0) + " " + y(0) + ")"
+  });
+  svg(origin, "title", {}, "雷达原点 (0, 0)");
+  const mark = Math.max(4, Math.min(8, 0.3 / metersPerPixel));
+  for (const point of frame.map) {
+    const dot = svg(view, "circle", {
+      cx: x(point.x), cy: y(point.y), r: mark, fill: "none",
+      stroke: mapColors[point.color] ?? "#687781", "stroke-width": 2.4
+    });
+    svg(dot, "title", {}, point.color + " · Map (" + point.x.toFixed(2) + ", " + point.y.toFixed(2) + ") m");
+  }
+  for (const point of frame.lidar) {
+    const cx = x(point.x), cy = y(point.y);
+    const cross = svg(view, "path", {
+      d: "M" + (cx - 3) + " " + cy + "h6 M" + cx + " " + (cy - 3) + "v6",
+      stroke: "#18252e", "stroke-width": 1.4
+    });
+    svg(cross, "title", {}, "雷达检测 (" + point.x.toFixed(2) + ", " + point.y.toFixed(2) + ") m");
+  }
+}
+
+function chartX(time) {
+  return chart.left + (chart.right - chart.left) * time / (duration || 1);
+}
+
+function axisStep(lines) {
+  let maximum = 0;
+  for (const line of lines) {
+    for (const event of line.frames) maximum = Math.max(maximum, line.value(event) ?? 0);
+  }
+  return Math.max(1, Math.ceil(maximum / 4));
+}
+
+function drawChart(countLines, rateLines) {
+  const view = element("trend");
+  view.replaceChildren();
+  const countStep = axisStep(countLines), rateStep = axisStep(rateLines);
+  const y = fraction => chart.bottom - (chart.bottom - chart.top) * fraction;
+  for (let i = 0; i <= 4; i++) {
+    const row = y(i / 4);
+    grid(view, chart.left, row, chart.right, row, i === 0);
+    svg(view, "text", { x: chart.left - 9, y: row + 4, "text-anchor": "end" }, i * countStep);
+    svg(view, "text", { x: chart.right + 9, y: row + 4 }, i * rateStep);
+  }
+  svg(view, "text", { x: 4, y: 16 }, "数量（个）");
+  svg(view, "text", { x: 636, y: 16, "text-anchor": "end" }, "帧率（Hz）");
+  for (let i = 0; i <= 4; i++) {
+    const time = (duration || 1) * i / 4;
+    svg(view, "text", { x: chartX(time), y: 294, "text-anchor": "middle" },
+        time.toFixed(duration >= 20 ? 0 : 2));
+  }
+  svg(view, "text", { x: 638, y: 294, "text-anchor": "end" }, "s");
+  for (const [line, step] of [
+    ...countLines.map(line => [line, countStep]),
+    ...rateLines.map(line => [line, rateStep])
+  ]) {
+    let path = "", last = null;
+    for (const frame of line.frames) {
+      const value = line.value(frame);
+      if (value === null) {
+        last = null;
+        continue;
+      }
+      const point = chartX(frame.time).toFixed(2) + " " + y(value / (step * 4)).toFixed(2);
+      path += last !== null && frame.time - last <= 1 ? "L" + point : "M" + point + "h0";
+      last = frame.time;
+    }
+    svg(view, "path", { d: path, fill: "none", stroke: line.color, "stroke-width": 2,
+      "stroke-linecap": "round", "stroke-dasharray": line.dash });
+  }
+  return svg(view, "line", { y1: chart.top, y2: chart.bottom, stroke: "#18252e", "stroke-width": 1 });
+}
+
+function lastAt(frames, time) {
+  let left = 0, right = frames.length;
+  while (left < right) {
+    const middle = Math.floor((left + right) / 2);
+    if (frames[middle].time <= time) left = middle + 1;
+    else right = middle;
+  }
+  return frames[left - 1];
+}
+
+function seek(time) {
+  slider.value = time;
+  element("clock").textContent = time.toFixed(2) + " / " + duration.toFixed(2) + " s";
+  const mapFrame = lastAt(mapFrames, time);
+  const yoloFrame = lastAt(yoloFrames, time);
+  const event = lastAt(events, time);
+  if (mapFrame !== visibleFrame) {
+    drawMap(mapFrame);
+    visibleFrame = mapFrame;
+  }
+  element("mapInfo").textContent = mapFrame
+    ? (mapFrame.frameId || "未标记坐标系") + " · " + mapFrame.time.toFixed(2) + " s 帧 · 雷达 " +
+      mapFrame.lidarCount + " · Map " + mapFrame.mapCount
+    : "此时还没有雷达和 Map 帧";
+  element("counts").textContent = "最近收到的 YOLO " + (yoloFrame
+    ? yoloFrame.yoloCount + "（" + yoloFrame.time.toFixed(2) + " s）" : "—") + " · Map " + (mapFrame?.mapCount ?? "—");
+  const rates = event && time - event.time <= 1 ? event.rates : [];
+  element("rates").textContent = ["雷达", "YOLO", "Map"].map((name, index) =>
+    name + " " + (rates[index] == null ? "—" : rates[index] + " Hz")).join(" · ");
+  cursor.setAttribute("x1", chartX(time));
+  cursor.setAttribute("x2", chartX(time));
+}
+
+function pause() {
+  cancelAnimationFrame(animation);
+  animation = 0;
+  previousTick = null;
+  play.textContent = "播放";
+}
+
+function tick(now) {
+  const delta = previousTick === null ? 0 : (now - previousTick) / 1000;
+  previousTick = now;
+  const time = Math.min(duration, Number(slider.value) + delta * Number(element("speed").value));
+  seek(time);
+  if (time >= duration) pause();
+  else animation = requestAnimationFrame(tick);
+}
+
+play.addEventListener("click", () => {
+  if (animation) {
+    pause();
+    return;
+  }
+  if (Number(slider.value) >= duration) seek(0);
+  play.textContent = "暂停";
+  animation = requestAnimationFrame(tick);
+});
+slider.addEventListener("input", () => seek(Number(slider.value)));
+element("file").addEventListener("change", async event => {
+  const file = event.target.files[0];
+  if (!file) return;
+  const id = ++loadId;
+  pause();
+  const status = element("status");
+  try {
+    const data = parseReplay(await file.text());
+    if (id !== loadId) return;
+    events = data.events;
+    mapFrames = events.filter(frame => frame.kind === "lidar_map");
+    yoloFrames = events.filter(frame => frame.kind === "yolo");
+    duration = events.at(-1).time;
+    mapScale = calculateMapScale(mapFrames);
+    drawMap(null);
+    visibleFrame = null;
+    cursor = drawChart([
+        { frames: yoloFrames, value: frame => frame.yoloCount, color: palette.orange, dash: "" },
+        { frames: mapFrames, value: frame => frame.mapCount, color: palette.red, dash: "5 3" }
+      ], [
+        { color: palette.blue, dash: "" },
+        { color: palette.purple, dash: "5 3" },
+        { color: palette.green, dash: "2 3" }
+      ].map((line, index) => ({ ...line, frames: events, value: frame => frame.rates[index] })));
+    slider.max = duration;
+    slider.disabled = play.disabled = duration === 0;
+    seek(events[0].time);
+    status.textContent = file.name + " · " + mapFrames.length + " 帧雷达/Map · " + yoloFrames.length + " 帧 YOLO";
+    if (data.missing || data.skipped || data.invalidPoints) {
+      status.textContent += " · 缺少 " + data.missing + " 个事件，跳过 " +
+        data.skipped + " 条不完整记录、" + data.invalidPoints + " 个无效坐标。";
+    }
+  } catch (error) {
+    if (id === loadId) status.textContent = error.message;
+  }
+});
+</script>

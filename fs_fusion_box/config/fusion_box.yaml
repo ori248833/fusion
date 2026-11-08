@@ -52,7 +52,7 @@
     showcase_height_min: -3.0
     showcase_height_max: 5.0
 
-    # CSV 调试：每帧创建子目录，并写入该帧的 fusion.csv 和 cones.csv。
+    # CSV 调试：保存逐帧匹配结果，以及同一运行目录下的 replay.csv。
     # 只记录至少成功匹配一对框的融合帧。
     enable_visual_csv: true
     visual_csv_output_directory: "~/.ros/fusion_debug"

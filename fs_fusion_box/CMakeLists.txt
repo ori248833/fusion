@@ -12,6 +12,7 @@ endif()
 # 1. 查找依赖
 # ==========================================
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -85,6 +86,7 @@ target_link_libraries(fusion_box_node
 )
 
 ament_target_dependencies(fusion_box_node
+  ament_index_cpp
   rclcpp
   rcl_interfaces
   std_msgs
@@ -124,6 +126,7 @@ install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
 
+install(FILES replay.html DESTINATION share/${PROJECT_NAME})
 
 
 ament_package()
